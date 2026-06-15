@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build Fragment.dll (Release)
+        run: cmake --build build --config Release
+
+      - name: Build & run the hook-engine unit test
+        shell: cmd
+        run: |
+          cl /nologo /O2 /MD /W3 test\hooktest.c /Fe:build\hooktest.exe /Fo:build\hooktest.obj || exit /b 1
+          build\hooktest.exe || exit /b 1
+
+      - name: Build & run the mock-libcurl integration test
+        shell: cmd
+        run: |
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /LD test\mockcurl.c /Fe:build\mockcurl.dll /Fo:build\mockcurl.obj || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS test\host_mock.c    /Fe:build\host_mock.exe /Fo:build\host_mock.obj || exit /b 1
+          build\host_mock.exe build\Release\Fragment.dll build\mockcurl.dll || exit /b 1
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fragment-x64
+          path: build/Release/Fragment.dll
+          if-no-files-found: error
+
+# NOTE: the full real-libcurl matrix (test/run.py) needs the third-party curl
+# corpus described in test/curl/README.md, which is intentionally not committed,
+# so it runs locally rather than in CI. CI proves, on a clean machine: a build,
+# the self-contained engine unit test (prologue relocation + fail-closed paths),
+# AND the mock-libcurl integration test -- which exercises the real injection +
+# export-resolution + curl_easy_setopt rewrite/idempotency/option-drop path
+# against a genuine (mock) libcurl DLL, with no third-party binaries.

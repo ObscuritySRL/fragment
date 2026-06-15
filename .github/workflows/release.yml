@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build (Release)
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release
+
+      - name: Smoke-test the release binary (mock-libcurl integration)
+        shell: cmd
+        run: |
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /LD test\mockcurl.c /Fe:build\mockcurl.dll /Fo:build\mockcurl.obj || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS test\host_mock.c    /Fe:build\host_mock.exe /Fo:build\host_mock.obj || exit /b 1
+          build\host_mock.exe build\Release\Fragment.dll build\mockcurl.dll || exit /b 1
+
+      - name: Stage package
+        shell: pwsh
+        run: |
+          $stage = "fragment-${{ github.ref_name }}-x64"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item build/Release/Fragment.dll $stage/
+          Copy-Item build/Release/fragment.exe  $stage/
+          if (Test-Path README.md) { Copy-Item README.md $stage/ }
+          if (Test-Path LICENSE)   { Copy-Item LICENSE   $stage/ }
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: fragment-${{ github.ref_name }}-x64.zip
+          generate_release_notes: true
