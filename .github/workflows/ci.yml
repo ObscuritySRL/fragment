@@ -111,6 +111,45 @@ jobs:
           if %errorlevel% NEQ 0 (echo CROSS-BITNESS INJECT FAILED & exit /b 1)
           echo cross-bitness inject OK
 
+  windows-arm64:
+    # Windows on ARM: the aarch64 engine backend (common/arch/aarch64, shared
+    # with linux-aarch64) under the Windows PE glue, built and tested natively on
+    # a Windows-11-ARM runner.
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC (arm64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Configure
+        run: cmake -S windows -B windows/build -A ARM64
+
+      - name: Build Fragment.dll (Release)
+        run: cmake --build windows/build --config Release
+
+      - name: Build & run the hook-engine unit test
+        shell: cmd
+        run: |
+          cl /nologo /O2 /MD /W3 windows\test\hooktest.c /Fe:windows\build\hooktest.exe /Fo:windows\build\hooktest.obj || exit /b 1
+          windows\build\hooktest.exe || exit /b 1
+
+      - name: Build & run the mock-libcurl integration test
+        shell: cmd
+        run: |
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /LD windows\test\mockcurl.c /Fe:windows\build\mockcurl.dll /Fo:windows\build\mockcurl.obj || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS windows\test\host_mock.c    /Fe:windows\build\host_mock.exe /Fo:windows\build\host_mock.obj || exit /b 1
+          windows\build\host_mock.exe windows\build\Release\Fragment.dll windows\build\mockcurl.dll || exit /b 1
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fragment-arm64
+          path: windows/build/Release/Fragment.dll
+          if-no-files-found: error
+
   linux:
     # Build and test natively on both Linux architectures the port supports.
     strategy:

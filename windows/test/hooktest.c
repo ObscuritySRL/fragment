@@ -183,4 +183,74 @@ int main(void) {
     return fails ? 1 : 0;
 }
 
+#elif defined(_M_ARM64) || defined(__aarch64__)
+/* Encode `adrp Rd, page(target)` for an instruction sitting at `pc`. */
+static uint32_t enc_adrp(int rd, uintptr_t pc, uintptr_t target) {
+    int64_t imm = (int64_t)((target & ~(uintptr_t)0xFFF)) - (int64_t)(pc & ~(uintptr_t)0xFFF);
+    imm >>= 12;
+    uint32_t immlo = (uint32_t)(imm & 3), immhi = (uint32_t)((imm >> 2) & 0x7FFFF);
+    return 0x90000000u | (immlo << 29) | (immhi << 5) | (uint32_t)rd;
+}
+
+int main(void) {
+    HookEngineInit();
+
+    /* ---- T1: position-independent prologue (copied verbatim) -------------
+     * mov w0,#0xAB ; ret */
+    uint32_t t1[] = { 0x52801560u, 0xD65F03C0u };
+    uint8_t* f1 = make_fn((uint8_t*)t1, sizeof(t1), NULL);
+    CHECK(f1 && ((fn0)f1)() == 0xAB, "T1 original returns 0xAB");
+    g_called = 0;
+    CHECK(InstallHook(f1, (void*)t1_detour, (void**)&t1_tramp), "T1 install (plain prologue)");
+    CHECK(((fn0)f1)() == 0xAB, "T1 hooked still returns 0xAB via trampoline");
+    CHECK(g_called == 1, "T1 detour ran exactly once");
+
+    /* ---- T2: ADRP relocation ---------------------------------------------
+     * adrp x1,page(&g_val) ; ldr w0,[x1,#off] ; ret -- the ADRP must be
+     * re-aimed from the trampoline so it still resolves &g_val. */
+    uint32_t t2[] = { 0x90000001u, 0xB9400020u, 0xD65F03C0u };
+    uint8_t* f2 = make_fn((uint8_t*)t2, sizeof(t2), &g_val);
+    {
+        DWORD old;
+        VirtualProtect(f2, 0x1000, PAGE_READWRITE, &old);
+        uint32_t adrp = enc_adrp(1, (uintptr_t)f2, (uintptr_t)&g_val);
+        uint32_t off  = (uint32_t)((uintptr_t)&g_val & 0xFFF);
+        uint32_t ldr  = 0xB9400000u | (((off >> 2) & 0xFFF) << 10) | (1u << 5) | 0u; /* ldr w0,[x1,#off] */
+        memcpy(f2 + 0, &adrp, 4);
+        memcpy(f2 + 4, &ldr, 4);
+        VirtualProtect(f2, 0x1000, PAGE_EXECUTE_READ, &old);
+        FlushInstructionCache(GetCurrentProcess(), f2, 0x1000);
+    }
+    g_val = 0x1234;
+    CHECK(((fn0)f2)() == 0x1234, "T2 original reads g_val=0x1234");
+    g_called = 0;
+    CHECK(InstallHook(f2, (void*)t2_detour, (void**)&t2_tramp), "T2 install (ADRP prologue)");
+    g_val = 0x5678;
+    CHECK(((fn0)f2)() == 0x5678, "T2 trampoline ADRP-reloc reads updated g_val (=0x5678)");
+    CHECK(g_called == 1, "T2 detour ran exactly once");
+
+    /* ---- T3: B relocation ------------------------------------------------
+     * b +12 ; udf ; udf ; mov w0,#0xCD ; ret -- the leading B leaves the copy
+     * window and must be re-encoded toward its original target. */
+    uint32_t t3[] = { 0x14000003u, 0x00000000u, 0x00000000u, 0x528019A0u, 0xD65F03C0u };
+    uint8_t* f3 = make_fn((uint8_t*)t3, sizeof(t3), NULL);
+    CHECK(((fn0)f3)() == 0xCD, "T3 original returns 0xCD");
+    g_called = 0;
+    CHECK(InstallHook(f3, (void*)t3_detour, (void**)&t3_tramp), "T3 install (B-relative prologue)");
+    CHECK(((fn0)f3)() == 0xCD, "T3 trampoline B-reloc returns 0xCD");
+    CHECK(g_called == 1, "T3 detour ran exactly once");
+
+    /* ---- T4: fail closed -------------------------------------------------
+     * cbz x0,#8 as the first instruction must be refused (a short conditional
+     * branch leaving the window cannot be guaranteed to reach). */
+    uint32_t t4[] = { 0xB4000040u, 0xD2800000u, 0xD65F03C0u };
+    uint8_t* f4 = make_fn((uint8_t*)t4, sizeof(t4), NULL);
+    void* tr4 = NULL;
+    uint32_t orig4; memcpy(&orig4, f4, 4);
+    CHECK(!InstallHook(f4, (void*)t1_detour, &tr4), "T4 cbz-leaving-window refused (fail closed)");
+    { uint32_t now; memcpy(&now, f4, 4); CHECK(now == orig4, "T4 target left unmodified after refusal"); }
+
+    printf(fails ? "\nHOOKTEST FAILED (%d failures)\n" : "\nHOOKTEST OK\n", fails);
+    return fails ? 1 : 0;
+}
 #endif

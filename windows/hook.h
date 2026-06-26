@@ -6,8 +6,9 @@
 #include <string.h>
 #include "log.h"
 
-#if !defined(_M_X64) && !defined(__x86_64__) && !defined(_M_IX86) && !defined(__i386__)
-#error "Fragment's hook engine (caller stubs, prologue decoder, patch) is x86-64 / i386 only."
+#if !defined(_M_X64) && !defined(__x86_64__) && !defined(_M_IX86) && !defined(__i386__) && \
+    !defined(_M_ARM64) && !defined(__aarch64__)
+#error "Fragment's hook engine (caller stubs, prologue decoder, patch) is x86-64 / i386 / aarch64 only."
 #endif
 
 /*
@@ -48,7 +49,9 @@
  *       shrink this window, but do not prove no such internal target exists.
  */
 
-#if defined(_M_IX86) || defined(__i386__)
+#if defined(_M_ARM64) || defined(__aarch64__)
+#include "../common/arch/aarch64/reloc.h"
+#elif defined(_M_IX86) || defined(__i386__)
 #include "../common/arch/i386/decode.h"
 #else
 #include "../common/arch/x86_64/decode.h"
@@ -120,7 +123,11 @@ static void* FrAllocNear(void* target, size_t size) {
     uintptr_t t  = (uintptr_t)target;
     uintptr_t lo = (uintptr_t)si.lpMinimumApplicationAddress;
     uintptr_t hi = (uintptr_t)si.lpMaximumApplicationAddress;
-    uintptr_t reach = 0x7FFF0000ULL;          /* stay safely under 2 GB */
+#if defined(_M_ARM64) || defined(__aarch64__)
+    uintptr_t reach = 0x07FF0000ULL;          /* stay safely under 128 MB (B imm26) */
+#else
+    uintptr_t reach = 0x7FFF0000ULL;          /* stay safely under 2 GB (E9 rel32)  */
+#endif
     if (t > reach && t - reach > lo) lo = t - reach;
     if (hi > t + reach) hi = t + reach;
 
@@ -425,6 +432,97 @@ static BOOL InstallHook(void* target, void* detour, void** outTramp) {
     *outTramp = tramp;
     LogDebug("[hook] installed @ %p copyLen=%d block=%p tramp=%p relay=%p\n",
              target, copyLen, (void*)block, (void*)tramp, (void*)relay);
+    return TRUE;
+}
+
+#elif defined(_M_ARM64) || defined(__aarch64__)
+/* ===== aarch64 backend: relocation shared in common/arch/aarch64 ======= */
+
+/* Every instruction is one 4-byte word, so there is no length decoding: the
+ * patch is a single B over the first instruction, and only that instruction is
+ * relocated (FrRelocOne). The jump back is a direct B; the relay reaches an
+ * arbitrary detour via LDR x16,#8 / BR x16. The 4-byte patch is a naturally-
+ * aligned atomic store, so the install is torn-write safe without suspending
+ * threads. Anything FrRelocOne cannot relocate (or a B out of +/-128 MB range)
+ * FAILS CLOSED, leaving the target untouched. */
+static BOOL InstallHook(void* target, void* detour, void** outTramp) {
+    uint8_t* tgt = (uint8_t*)target;
+    if (((uintptr_t)tgt & 3) != 0) { LogError("[hook] target not 4-aligned @ %p\n", target); return FALSE; }
+
+    uint32_t first;
+    memcpy(&first, tgt, 4);
+
+    /* block: [trampoline: reloc'd insn (4) + B-back (4)][relay: LDR/BR/.quad (16)] */
+    const size_t trampLen = 8, blockSize = 24;
+    uint8_t* block = (uint8_t*)FrAllocNear(target, blockSize);
+    if (!block) { LogError("[hook] no free memory within 128MB of %p\n", target); return FALSE; }
+    uint8_t* tramp = block;
+    uint8_t* relay = block + trampLen;
+
+    uint32_t reloc;
+    if (!FrRelocOne(first, (uintptr_t)tgt, (uintptr_t)tramp, &reloc)) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        LogError("[hook] un-relocatable prologue insn 0x%08x @ %p; refusing\n", first, target);
+        return FALSE;
+    }
+    if (!FrInRangeB((uintptr_t)(tramp + 4), (uintptr_t)(tgt + 4))) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        LogError("[hook] trampoline out of B range to %p; refusing\n", (void*)(tgt + 4));
+        return FALSE;
+    }
+    if (!FrInRangeB((uintptr_t)tgt, (uintptr_t)relay)) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        LogError("[hook] relay out of B range from %p; refusing\n", target);
+        return FALSE;
+    }
+
+    memcpy(tramp, &reloc, 4);
+    uint32_t bback = FrEncB((uintptr_t)(tramp + 4), (uintptr_t)(tgt + 4));
+    memcpy(tramp + 4, &bback, 4);
+
+    uint32_t ldr = 0x58000050u;   /* LDR x16, #8 */
+    uint32_t br  = 0xD61F0200u;   /* BR  x16     */
+    uint64_t det = (uint64_t)(uintptr_t)detour;
+    memcpy(relay + 0, &ldr, 4);
+    memcpy(relay + 4, &br, 4);
+    memcpy(relay + 8, &det, 8);
+
+    DWORD old;
+    if (!VirtualProtect(block, blockSize, PAGE_EXECUTE_READ, &old)) { VirtualFree(block, 0, MEM_RELEASE); LogError("[hook] VirtualProtect(block) failed %lu\n", GetLastError()); return FALSE; }
+    FlushInstructionCache(GetCurrentProcess(), block, blockSize);
+
+    /* patch: a single naturally-aligned, atomic 4-byte B to the relay. */
+    DWORD oldp;
+    if (!VirtualProtect(tgt, 4, PAGE_EXECUTE_READWRITE, &oldp)) { VirtualFree(block, 0, MEM_RELEASE); LogError("[hook] VirtualProtect(target) failed %lu\n", GetLastError()); return FALSE; }
+
+    /* Record the hook (capturing the ORIGINAL word) BEFORE patching. If we
+     * cannot record it, fail closed -- never patch a target we can't restore. */
+    FrHook* h = (FrHook*)FrHeapAlloc(sizeof(FrHook));
+    if (!h) {
+        VirtualProtect(tgt, 4, oldp, &oldp);
+        VirtualFree(block, 0, MEM_RELEASE);
+        LogError("[hook] out of memory recording hook @ %p\n", target);
+        return FALSE;
+    }
+    h->target = target; h->block = block; h->blockSize = blockSize;
+    h->savedLen = 4;
+    memcpy(h->saved, tgt, 4);
+
+    uint32_t patch = FrEncB((uintptr_t)tgt, (uintptr_t)relay);
+    InterlockedExchange((volatile LONG*)tgt, (LONG)patch);   /* one atomic 4-byte store */
+
+    VirtualProtect(tgt, 4, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), tgt, 4);
+
+    /* 6. register for teardown (h is non-NULL here). */
+    HookEngineInit();
+    EnterCriticalSection(&gFrLock);
+    h->next = gFrHooks; gFrHooks = h;
+    LeaveCriticalSection(&gFrLock);
+
+    *outTramp = tramp;
+    LogDebug("[hook] installed @ %p insn=0x%08x block=%p tramp=%p relay=%p\n",
+             target, first, (void*)block, (void*)tramp, (void*)relay);
     return TRUE;
 }
 

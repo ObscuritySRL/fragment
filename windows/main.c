@@ -167,6 +167,17 @@ static const CurlSig kSetoptSigs[] = {
     { "\x55\x89\xE5",                 "xxx"     },   // push ebp; mov ebp,esp  (MinGW)
     { "\xF3\x0F\x1E\xFB\x55\x8B\xEC", "xxxxxxx" },   // endbr32; push ebp; mov ebp,esp
 };
+#elif defined(_M_ARM64) || defined(__aarch64__)
+// Best-effort AArch64 frame-setup prologues (the PAC and non-PAC
+// `stp x29,x30,[sp,#-N]!` forms and a `sub sp` + stp form), to be evidence-
+// refined against a stripped ARM64 libcurl. The immediate fields are masked. A
+// shared-library build resolves by export, so these matter only for a
+// statically-linked ARM64 program.
+static const CurlSig kSetoptSigs[] = {
+    { "\x7F\x23\x03\xD5\xFD\x7B\x00\xA9", "xxxxxx?x" },   // pacibsp; stp x29,x30,[sp,#-N]!
+    { "\xFD\x7B\x00\xA9\xFD\x03\x00\x91", "xx?xxxxx" },   // stp x29,x30,[sp,#-N]!; mov x29,sp
+    { "\xFF\x00\x00\xD1\xFD\x7B\x00\xA9", "x??xxx?x" },   // sub sp,sp,#N; stp x29,x30,[sp,#M]
+};
 #endif
 #define kSetoptSigCount (sizeof(kSetoptSigs) / sizeof(kSetoptSigs[0]))
 
@@ -192,6 +203,14 @@ static const CurlSig kUrlSetSigs[] = {
     { "\x55\x8B\xEC",                 "xxx"     },   // push ebp; mov ebp,esp  (MSVC)
     { "\x55\x89\xE5",                 "xxx"     },   // push ebp; mov ebp,esp  (MinGW)
     { "\xF3\x0F\x1E\xFB\x55\x8B\xEC", "xxxxxxx" },   // endbr32; push ebp; mov ebp,esp
+};
+#elif defined(_M_ARM64) || defined(__aarch64__)
+// curl_url_set frame prologues for a statically-linked ARM64 program (best-
+// effort, same frame-setup forms as above; DLL builds resolve it by export).
+static const CurlSig kUrlSetSigs[] = {
+    { "\x7F\x23\x03\xD5\xFD\x7B\x00\xA9", "xxxxxx?x" },   // pacibsp; stp x29,x30,[sp,#-N]!
+    { "\xFD\x7B\x00\xA9\xFD\x03\x00\x91", "xx?xxxxx" },   // stp x29,x30,[sp,#-N]!; mov x29,sp
+    { "\xFF\x00\x00\xD1\xFD\x7B\x00\xA9", "x??xxx?x" },   // sub sp,sp,#N; stp x29,x30,[sp,#M]
 };
 #endif
 #define kUrlSetSigCount (sizeof(kUrlSetSigs) / sizeof(kUrlSetSigs[0]))

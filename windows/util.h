@@ -252,4 +252,65 @@ inline CurlUrlSetFn GenerateUrlSetCaller(LPVOID pContext, LPVOID pCalled) {
 
     return (CurlUrlSetFn) allocatedCode;
 }
+
+#elif defined(_M_ARM64) || defined(__aarch64__)
+// AAPCS64 passes the first arguments in x0-x7, so -- as on x86-64 -- we prepend
+// the context by a register shuffle rather than building a stack frame: shift
+// (curl, option, value) right one register, put the context in x0, and tail-
+// branch to the detour through a loaded 64-bit pointer (BR x16). ARM64 has a
+// non-coherent instruction cache, so the freshly written stub is flushed before
+// it is entered (the x86 stubs need no flush).
+inline CurlSetoptFn GenerateCaller(LPVOID pFirstParam, LPVOID pCalled) {
+    const byte code[] = {
+            0xE3, 0x03, 0x02, 0xAA,   // mov x3, x2   (value)
+            0xE2, 0x03, 0x01, 0x2A,   // mov w2, w1   (option)
+            0xE1, 0x03, 0x00, 0xAA,   // mov x1, x0   (curl)
+            0x60, 0x00, 0x00, 0x58,   // ldr x0, #12  -> ctx
+            0x90, 0x00, 0x00, 0x58,   // ldr x16,#16  -> detour
+            0x00, 0x02, 0x1F, 0xD6,   // br  x16
+            0,0,0,0,0,0,0,0,          // .quad ctx
+            0,0,0,0,0,0,0,0,          // .quad detour
+    };
+
+    byte* allocatedCode = VirtualAlloc(NULL, sizeof(code), MEM_COMMIT, PAGE_READWRITE);
+    if (!allocatedCode) return NULL;
+    memcpy(allocatedCode, code, sizeof(code));
+    memcpy(allocatedCode+24, &pFirstParam, sizeof(pFirstParam));
+    memcpy(allocatedCode+32, &pCalled, sizeof(pCalled));
+
+    DWORD dummy;
+    VirtualProtect(allocatedCode, sizeof(code), PAGE_EXECUTE_READ, &dummy);
+    FlushInstructionCache(GetCurrentProcess(), allocatedCode, sizeof(code));
+
+    return (CurlSetoptFn) allocatedCode;
+}
+
+// Caller stub for the 4-argument curl_url_set(handle, what, part, flags); shifts
+// the args right one slot and passes flags as the detour's 5th argument (x4, the
+// fifth AAPCS64 integer register), then prepends the context in x0.
+inline CurlUrlSetFn GenerateUrlSetCaller(LPVOID pContext, LPVOID pCalled) {
+    const byte code[] = {
+            0xE4, 0x03, 0x03, 0x2A,   // mov w4, w3   (flags)
+            0xE3, 0x03, 0x02, 0xAA,   // mov x3, x2   (part)
+            0xE2, 0x03, 0x01, 0x2A,   // mov w2, w1   (what)
+            0xE1, 0x03, 0x00, 0xAA,   // mov x1, x0   (handle)
+            0x60, 0x00, 0x00, 0x58,   // ldr x0, #12  -> ctx
+            0x90, 0x00, 0x00, 0x58,   // ldr x16,#16  -> detour
+            0x00, 0x02, 0x1F, 0xD6,   // br  x16
+            0,0,0,0,0,0,0,0,          // .quad ctx
+            0,0,0,0,0,0,0,0,          // .quad detour
+    };
+
+    byte* allocatedCode = VirtualAlloc(NULL, sizeof(code), MEM_COMMIT, PAGE_READWRITE);
+    if (!allocatedCode) return NULL;
+    memcpy(allocatedCode, code, sizeof(code));
+    memcpy(allocatedCode+28, &pContext, sizeof(pContext));
+    memcpy(allocatedCode+36, &pCalled, sizeof(pCalled));
+
+    DWORD dummy;
+    VirtualProtect(allocatedCode, sizeof(code), PAGE_EXECUTE_READ, &dummy);
+    FlushInstructionCache(GetCurrentProcess(), allocatedCode, sizeof(code));
+
+    return (CurlUrlSetFn) allocatedCode;
+}
 #endif
