@@ -7,17 +7,27 @@ on:
 
 jobs:
   windows:
+    # Build and test both bitnesses with MSVC. x86 reuses the shared i386 engine
+    # backend (common/arch/i386), x64 the x86_64 backend.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            cmake_a: x64
+          - arch: x86
+            cmake_a: Win32
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up MSVC (x64)
+      - name: Set up MSVC (${{ matrix.arch }})
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
+          arch: ${{ matrix.arch }}
 
       - name: Configure
-        run: cmake -S windows -B windows/build -A x64
+        run: cmake -S windows -B windows/build -A ${{ matrix.cmake_a }}
 
       - name: Build Fragment.dll (Release)
         run: cmake --build windows/build --config Release
@@ -38,7 +48,7 @@ jobs:
       - name: Upload DLL artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Fragment-x64
+          name: Fragment-${{ matrix.arch }}
           path: windows/build/Release/Fragment.dll
           if-no-files-found: error
 

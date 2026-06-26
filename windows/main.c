@@ -135,6 +135,7 @@ CURLUcode CurlUrlSetDetour(CurlUrlSetCtx* ctx, void* handle, CURLUPart what, con
 // no export table to resolve. Shared-library libcurl never needs these.
 typedef struct { const char* pattern; const char* mask; } CurlSig;
 
+#if defined(_M_X64) || defined(__x86_64__)
 static const CurlSig kSetoptSigs[] = {
     // Newer MSVC (the project's original signature).
     { "\x48\x89\x00\x00\x00\x48\x89\x00\x00\x00\x48\x89\x00\x00\x00\x57\x48\x83\xEC\x00\x33\xED\x49\x8B\x00\x48\x8B\x00\x81\xFA",
@@ -155,11 +156,24 @@ static const CurlSig kSetoptSigs[] = {
     { "\x55\x56\x57\x48\x83\xEC\x00\x48\x8D\x6C\x24\x00\x4C\x89\x45\x00\x4C\x89\x4D\x00\xB8\x2B\x00\x00\x00\x48\x85\xC9",
       "xxxxxx?xxxx?xxx?xxx?xxxxxxxx" },
 };
+#elif defined(_M_IX86) || defined(__i386__)
+// Best-effort 32-bit __cdecl frame prologues (MSVC hotpatch `mov edi,edi` + the
+// plain frame-pointer entry, MinGW's `89 E5` form, and the CET endbr32 variant),
+// to be evidence-refined against a stripped x86 libcurl. A shared-library build
+// resolves by export, so these matter only for a statically-linked x86 program.
+static const CurlSig kSetoptSigs[] = {
+    { "\x8B\xFF\x55\x8B\xEC",         "xxxxx"   },   // mov edi,edi; push ebp; mov ebp,esp
+    { "\x55\x8B\xEC",                 "xxx"     },   // push ebp; mov ebp,esp  (MSVC)
+    { "\x55\x89\xE5",                 "xxx"     },   // push ebp; mov ebp,esp  (MinGW)
+    { "\xF3\x0F\x1E\xFB\x55\x8B\xEC", "xxxxxxx" },   // endbr32; push ebp; mov ebp,esp
+};
+#endif
 #define kSetoptSigCount (sizeof(kSetoptSigs) / sizeof(kSetoptSigs[0]))
 
 // curl_url_set prologues (statically-linked URL-API fallback). DLL
 // builds resolve it by export, so these only matter for the rare
 // statically-linked program that builds URLs via the curl_url API.
+#if defined(_M_X64) || defined(__x86_64__)
 static const CurlSig kUrlSetSigs[] = {
     // MinGW-GCC: push r15..r12/rbp/rdi/rsi/rbx; sub rsp,imm32;
     // mov rbx,rcx; mov rcx,[rip+canary]; mov esi,edx; mov rbp,r8.
@@ -170,6 +184,16 @@ static const CurlSig kUrlSetSigs[] = {
     { "\xF3\x0F\x1E\xFA\x55\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x53\x48\x81\xEC\x00\x00\x00\x00\x48\x8D\xAC\x24\x00\x00\x00\x00\x48\x85\xC9\x74\x00\x4D\x89\xC6\x89\xD3\x48\x89\xCE\x4D\x85\xC0",
       "xxxxxxxxxxxxxxxxxxx????xxxx????xxxx?xxxxxxxxxxx" },
 };
+#elif defined(_M_IX86) || defined(__i386__)
+// curl_url_set frame prologues for a statically-linked x86 program (best-effort;
+// DLL builds resolve it by export).
+static const CurlSig kUrlSetSigs[] = {
+    { "\x8B\xFF\x55\x8B\xEC",         "xxxxx"   },   // mov edi,edi; push ebp; mov ebp,esp
+    { "\x55\x8B\xEC",                 "xxx"     },   // push ebp; mov ebp,esp  (MSVC)
+    { "\x55\x89\xE5",                 "xxx"     },   // push ebp; mov ebp,esp  (MinGW)
+    { "\xF3\x0F\x1E\xFB\x55\x8B\xEC", "xxxxxxx" },   // endbr32; push ebp; mov ebp,esp
+};
+#endif
 #define kUrlSetSigCount (sizeof(kUrlSetSigs) / sizeof(kUrlSetSigs[0]))
 
 // Follow incremental-link / IAT jump thunks (E9/EB/FF25) to the real

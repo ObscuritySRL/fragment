@@ -6,8 +6,8 @@
 #include <string.h>
 #include "log.h"
 
-#if !defined(_M_X64) && !defined(__x86_64__)
-#error "Fragment's hook engine (caller stubs, prologue decoder, patch) is x86-64 only."
+#if !defined(_M_X64) && !defined(__x86_64__) && !defined(_M_IX86) && !defined(__i386__)
+#error "Fragment's hook engine (caller stubs, prologue decoder, patch) is x86-64 / i386 only."
 #endif
 
 /*
@@ -48,7 +48,11 @@
  *       shrink this window, but do not prove no such internal target exists.
  */
 
+#if defined(_M_IX86) || defined(__i386__)
+#include "../common/arch/i386/decode.h"
+#else
 #include "../common/arch/x86_64/decode.h"
+#endif
 
 /* ---- installed-hook registry (for clean teardown) ---------------------- */
 typedef struct FrHook {
@@ -156,6 +160,9 @@ static void* FrAllocNear(void* target, size_t size) {
     }
     return NULL;
 }
+
+#if defined(_M_X64) || defined(__x86_64__)
+/* ===== x86-64 backend (prologue decoder shared in common/) ============== */
 
 /* Write a 14-byte absolute jump (jmp [rip+0]; .quad dest) at `p`. */
 static void FrWriteAbsJmp(uint8_t* p, uint64_t dest) {
@@ -300,6 +307,128 @@ static BOOL InstallHook(void* target, void* detour, void** outTramp) {
              target, copyLen, (void*)block, (void*)tramp, (void*)relay);
     return TRUE;
 }
+
+#elif defined(_M_IX86) || defined(__i386__)
+/* ===== i386 backend (prologue decoder shared in common/) ================ */
+
+/* Write a 6-byte absolute jump (push imm32; ret) at `p`. IA-32 has no
+ * RIP-relative form, so the destination is pushed as an absolute immediate and
+ * `ret` consumes it -- reaching anywhere in the address space without a scratch
+ * register or a memory slot (the 32-bit analogue of the x86-64 jmp [rip+0]). */
+static void FrWriteAbsJmp(uint8_t* p, uint32_t dest) {
+    p[0] = 0x68;                          /* push imm32 */
+    memcpy(p + 1, &dest, 4);
+    p[5] = 0xC3;                          /* ret        */
+}
+
+static BOOL InstallHook(void* target, void* detour, void** outTramp) {
+    uint8_t* tgt = (uint8_t*)target;
+
+    /* 1. measure whole instructions covering >= 5 bytes; remember offsets. */
+    int    offs[16];
+    FrInsn ins[16];
+    int    n = 0, copyLen = 0;
+    while (copyLen < 5) {
+        if (n >= 16) { LogError("[hook] prologue too long @ %p\n", target); return FALSE; }
+        FrInsn d;
+        int l = FrDecode(tgt + copyLen, &d);
+        if (l <= 0) { LogError("[hook] undecodable byte 0x%02x @ %p+%d\n", tgt[copyLen], target, copyLen); return FALSE; }
+        offs[n] = copyLen; ins[n] = d; n++; copyLen += l;
+    }
+    if (copyLen > 20) { LogError("[hook] prologue copy too large (%d) @ %p\n", copyLen, target); return FALSE; }
+
+    /* 2. allocate the near block: [trampoline][relay]. */
+    size_t trampLen  = (size_t)copyLen + 6;
+    size_t blockSize = trampLen + 6;
+    uint8_t* block = (uint8_t*)FrAllocNear(target, blockSize);
+    if (!block) { LogError("[hook] no free memory within 2GB of %p\n", target); return FALSE; }
+    uint8_t* tramp = block;
+    uint8_t* relay = block + trampLen;
+
+    /* 3. copy + relocate the prologue into the trampoline. A 32-bit disp32 is an
+     * absolute address (IA-32 has no RIP-relative form), so memory operands copy
+     * verbatim; the only relocations are rel8/rel32 branch operands, and rel32
+     * spans the whole 4 GB so it never falls out of range. */
+    memcpy(tramp, tgt, (size_t)copyLen);
+    for (int k = 0; k < n; k++) {
+        int o = offs[k];
+        FrInsn* d = &ins[k];
+        int ilen = (k + 1 < n ? offs[k + 1] : copyLen) - o;
+
+        if (d->relKind) {
+            int32_t rel;
+            if (d->relKind == 1) { int8_t r; memcpy(&r, tgt + o + d->relOff, 1); rel = r; }
+            else                 { memcpy(&rel, tgt + o + d->relOff, 4); }
+            uint8_t* absTarget = tgt + o + ilen + rel;
+            if (absTarget >= tgt && absTarget < tgt + copyLen) {
+                /* branch stays inside the copied block: distance preserved. */
+            } else if (d->relKind == 4) {
+                int32_t nr = (int32_t)(absTarget - (tramp + o + ilen));
+                memcpy(tramp + o + d->relOff, &nr, 4);
+            } else {
+                /* short branch leaving the window: cannot keep length. */
+                VirtualFree(block, 0, MEM_RELEASE);
+                LogError("[hook] short branch in prologue @ %p; refusing\n", target);
+                return FALSE;
+            }
+        }
+    }
+    FrWriteAbsJmp(tramp + copyLen, (uint32_t)(uintptr_t)(tgt + copyLen));  /* jump back */
+    FrWriteAbsJmp(relay, (uint32_t)(uintptr_t)detour);                    /* to detour */
+
+    /* 4. make the block executable. */
+    DWORD old;
+    if (!VirtualProtect(block, blockSize, PAGE_EXECUTE_READ, &old)) { VirtualFree(block, 0, MEM_RELEASE); LogError("[hook] VirtualProtect(block) failed %lu\n", GetLastError()); return FALSE; }
+    FlushInstructionCache(GetCurrentProcess(), block, blockSize);
+
+    /* 5. patch the target: E9 rel32 -> relay, NOP-fill any remainder. rel32
+     * spans the whole 32-bit address space, so the relay is always reachable and
+     * the displacement needs no range check. The write is byte-wise over exactly
+     * the decoded prologue; as on x86-64 the torn window is benign in Fragment's
+     * flow (hooks land before the curl module is exercised), and there is no
+     * lock-free aligned 8-byte store on IA-32 to take the 64-bit atomic path. */
+    int32_t jrel = (int32_t)(relay - (tgt + 5));
+
+    DWORD oldp;
+    if (!VirtualProtect(tgt, (size_t)copyLen, PAGE_EXECUTE_READWRITE, &oldp)) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        LogError("[hook] VirtualProtect(target) failed %lu\n", GetLastError());
+        return FALSE;
+    }
+
+    /* Record the hook (capturing the ORIGINAL bytes) BEFORE patching. If we
+     * cannot record it, fail closed -- never patch a target we can't restore. */
+    FrHook* h = (FrHook*)FrHeapAlloc(sizeof(FrHook));
+    if (!h) {
+        VirtualProtect(tgt, (size_t)copyLen, oldp, &oldp);
+        VirtualFree(block, 0, MEM_RELEASE);
+        LogError("[hook] out of memory recording hook @ %p\n", target);
+        return FALSE;
+    }
+    h->target = target; h->block = block; h->blockSize = blockSize;
+    h->savedLen = (size_t)copyLen;
+    memcpy(h->saved, tgt, (size_t)copyLen);
+
+    tgt[0] = 0xE9;
+    memcpy(tgt + 1, &jrel, 4);
+    for (int b = 5; b < copyLen; b++) tgt[b] = 0x90;
+
+    VirtualProtect(tgt, (size_t)copyLen, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), tgt, (size_t)copyLen);
+
+    /* 6. register for teardown (h is non-NULL here). */
+    HookEngineInit();
+    EnterCriticalSection(&gFrLock);
+    h->next = gFrHooks; gFrHooks = h;
+    LeaveCriticalSection(&gFrLock);
+
+    *outTramp = tramp;
+    LogDebug("[hook] installed @ %p copyLen=%d block=%p tramp=%p relay=%p\n",
+             target, copyLen, (void*)block, (void*)tramp, (void*)relay);
+    return TRUE;
+}
+
+#endif
 
 /* Restore every installed hook and release its block. Call only when no other
  * thread can be inside a detour/trampoline (e.g. process teardown).

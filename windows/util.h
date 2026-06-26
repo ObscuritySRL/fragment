@@ -119,6 +119,7 @@ inline BOOL ModuleContainsAscii(PBYTE base, SIZE_T imageSize, const char* needle
     return FALSE;
 }
 
+#if defined(_M_X64) || defined(__x86_64__)
 inline CurlSetoptFn GenerateCaller(LPVOID pFirstParam, LPVOID pCalled) {
     const byte code[] = {
             0x4C, 0x89, 0x44, 0x24, 0x18, // mov qword ptr [rsp + 0x18], r8
@@ -184,3 +185,71 @@ inline CurlUrlSetFn GenerateUrlSetCaller(LPVOID pContext, LPVOID pCalled) {
 
     return (CurlUrlSetFn) allocatedCode;
 }
+
+#elif defined(_M_IX86) || defined(__i386__)
+inline CurlSetoptFn GenerateCaller(LPVOID pFirstParam, LPVOID pCalled) {
+    // __cdecl passes everything on the stack, so we cannot prepend the context
+    // by a register shuffle as on x86-64; we build a fresh call frame instead.
+    // Frame: save ebp, then `and esp,-16` realigns to the 16-byte boundary the
+    // compiler-built detour may assume (aligned SSE), re-push (curl, option,
+    // value) from the saved frame, prepend the context, and call the shared C
+    // detour. `leave; ret` tears the frame down and returns to the original
+    // caller (cdecl: the caller pops the original args).
+    const byte code[] = {
+            0x55,                         // push ebp
+            0x89, 0xE5,                   // mov ebp, esp
+            0x83, 0xE4, 0xF0,             // and esp, -16
+            0xFF, 0x75, 0x10,             // push [ebp+16]  (value)
+            0xFF, 0x75, 0x0C,             // push [ebp+12]  (option)
+            0xFF, 0x75, 0x08,             // push [ebp+8]   (curl)
+            0x68, 0,0,0,0,                // push <ctx>
+            0xB8, 0,0,0,0,                // mov eax, <detour>
+            0xFF, 0xD0,                   // call eax
+            0xC9,                         // leave
+            0xC3                          // ret
+    };
+
+    byte* allocatedCode = VirtualAlloc(NULL, sizeof(code), MEM_COMMIT, PAGE_READWRITE);
+    if (!allocatedCode) return NULL;
+    memcpy(allocatedCode, code, sizeof(code));
+    memcpy(allocatedCode+16, &pFirstParam, sizeof(pFirstParam));
+    memcpy(allocatedCode+21, &pCalled, sizeof(pCalled));
+
+    DWORD dummy;
+    VirtualProtect(allocatedCode, sizeof(code), PAGE_EXECUTE_READ, &dummy);
+
+    return (CurlSetoptFn) allocatedCode;
+}
+
+// Caller stub for the 4-argument curl_url_set(handle, what, part, flags); shifts
+// the args right one slot and passes flags as the detour's 5th argument. The
+// extra `sub esp,12` keeps the five pushed dwords 16-byte aligned at the call.
+inline CurlUrlSetFn GenerateUrlSetCaller(LPVOID pContext, LPVOID pCalled) {
+    const byte code[] = {
+            0x55,                         // push ebp
+            0x89, 0xE5,                   // mov ebp, esp
+            0x83, 0xE4, 0xF0,             // and esp, -16
+            0x83, 0xEC, 0x0C,             // sub esp, 12
+            0xFF, 0x75, 0x14,             // push [ebp+20]  (flags)
+            0xFF, 0x75, 0x10,             // push [ebp+16]  (part)
+            0xFF, 0x75, 0x0C,             // push [ebp+12]  (what)
+            0xFF, 0x75, 0x08,             // push [ebp+8]   (handle)
+            0x68, 0,0,0,0,                // push <ctx>
+            0xB8, 0,0,0,0,                // mov eax, <detour>
+            0xFF, 0xD0,                   // call eax
+            0xC9,                         // leave
+            0xC3                          // ret
+    };
+
+    byte* allocatedCode = VirtualAlloc(NULL, sizeof(code), MEM_COMMIT, PAGE_READWRITE);
+    if (!allocatedCode) return NULL;
+    memcpy(allocatedCode, code, sizeof(code));
+    memcpy(allocatedCode+22, &pContext, sizeof(pContext));
+    memcpy(allocatedCode+27, &pCalled, sizeof(pCalled));
+
+    DWORD dummy;
+    VirtualProtect(allocatedCode, sizeof(code), PAGE_EXECUTE_READ, &dummy);
+
+    return (CurlUrlSetFn) allocatedCode;
+}
+#endif
