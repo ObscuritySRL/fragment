@@ -38,6 +38,16 @@ jobs:
           cl /nologo /O2 /MD /W3 windows\test\hooktest.c /Fe:windows\build\hooktest.exe /Fo:windows\build\hooktest.obj || exit /b 1
           windows\build\hooktest.exe || exit /b 1
 
+      # Cross-bitness export resolver (PE32 only): the parser the 64-bit
+      # fragment.exe runs over a WOW64 target's 32-bit kernel32 to find
+      # LoadLibraryA, exercised here over the real kernel32 on the x86 leg.
+      - name: Build & run the cross-bitness export-resolver test
+        if: matrix.arch == 'x86'
+        shell: cmd
+        run: |
+          cl /nologo /O2 /MD /W3 windows\test\pe32test.c /Fe:windows\build\pe32test.exe /Fo:windows\build\pe32test.obj || exit /b 1
+          windows\build\pe32test.exe || exit /b 1
+
       - name: Build & run the mock-libcurl integration test
         shell: cmd
         run: |
