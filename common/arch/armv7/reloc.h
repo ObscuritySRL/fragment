@@ -143,13 +143,16 @@ static int FrRelocThumb(const uint8_t* p, int len, uintptr_t src, uintptr_t dst,
             memcpy(out, &o, 2);
             return 1;
         }
-        /* ADR (0xA000) and the short branches B<c> (0xD000) / B (0xE000) have
-         * only kilobyte reach and `add rd,pc` (0x4478) re-bases on PC -- none
-         * survive a far move, so fail closed. */
+        /* ADR (0xA000), the short branches B<c> (0xD000) / B (0xE000),
+         * CBZ/CBNZ (0xB100), and `add rd,pc` (0x4478) / `mov rd,pc` (0x4678)
+         * all re-base on PC and have only kilobyte (or no) reach -- none survive
+         * a far move, so fail closed. */
         if ((hw1 & 0xF800) == 0xA000 ||                     /* ADR Rd,PC,#imm   */
             (hw1 & 0xF000) == 0xD000 ||                     /* B<cond> / SVC    */
             (hw1 & 0xF800) == 0xE000 ||                     /* B (T2)           */
-            (hw1 & 0xFF78) == 0x4478)                       /* add rd, pc       */
+            (hw1 & 0xF500) == 0xB100 ||                     /* CBZ / CBNZ       */
+            (hw1 & 0xFF78) == 0x4478 ||                     /* add rd, pc       */
+            (hw1 & 0xFF78) == 0x4678)                       /* mov rd, pc       */
             return 0;
         memcpy(out, p, 2);                                  /* position-independent */
         return 1;
@@ -203,9 +206,18 @@ static int FrRelocThumb(const uint8_t* p, int len, uintptr_t src, uintptr_t dst,
         memcpy(out + 0, &o1, 2); memcpy(out + 2, &o2, 2);
         return 1;
     }
-    /* ADR / ADDW / SUBW Rd,PC,#imm12 re-base on PC and cannot be pooled -> refuse. */
-    if (((hw1 & 0xFBFF) == 0xF20F) ||                       /* ADR / ADDW (add) */
-        ((hw1 & 0xFBFF) == 0xF2AF))                         /* ADR / SUBW (sub) */
+    /* Fail closed on every remaining PC-relative 32-bit form (mirroring the A32
+     * refuse-list): the non-word literal loads (LDRB/H/SB/SH.W), LDRD/STRD and
+     * TBB/TBH, the coprocessor / VFP literals (VLDR), the ADR/ADDW/SUBW Rd,PC
+     * forms, and the branches the B.W/BL handler above did not take -- the
+     * conditional B.W (T3) and BLX-immediate (both clear hw2 bit 12), and the
+     * misc-control space. The word `ldr(.w)` literal was already pooled above. */
+    if (((hw1 & 0xFE1F) == 0xF81F) ||                       /* single load/store literal, Rn=PC (non-word) */
+        ((hw1 & 0xFE5F) == 0xE85F) ||                       /* LDRD/STRD literal / TBB/TBH, Rn=PC           */
+        ((hw1 & 0xFE1F) == 0xEC1F) ||                       /* coprocessor / VFP literal, Rn=PC             */
+        ((hw1 & 0xFBFF) == 0xF20F) ||                       /* ADR / ADDW Rd,PC                              */
+        ((hw1 & 0xFBFF) == 0xF2AF) ||                       /* ADR / SUBW Rd,PC                              */
+        ((hw1 & 0xF800) == 0xF000 && (hw2 & 0x8000) == 0x8000 && (hw2 & 0x1000) == 0))  /* cond B.W(T3)/BLX/misc */
         return 0;
     memcpy(out, p, 4);                                      /* position-independent */
     return 1;

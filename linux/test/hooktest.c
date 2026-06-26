@@ -249,6 +249,16 @@ int main(void) {
     CHECK(!InstallHook(f7, (void*)t1_detour, &tr7), "T7 (A32) ADR refused (fail closed)");
     CHECK(f7[0] == 0x04 && f7[3] == 0xE2, "T7 target left unmodified after refusal");
 
+    /* T8: T32 `vldr d0,[pc,#imm]` -- a non-word PC-relative literal (the head of
+     * a stock double-returning prologue). It is not the pooled word `ldr`, so it
+     * MUST fail closed rather than be copied verbatim. */
+    uint8_t t8[] = { 0x9F,0xED,0x01,0x0B, 0x70,0x47, 0x00,0xBF,
+                     0x6E,0x86,0x1B,0xF0, 0xF9,0x21,0x09,0x40 };
+    uint8_t* f8 = make_fn(t8, sizeof(t8), NULL);
+    void* tr8 = NULL;
+    CHECK(!InstallHook((void*)((uintptr_t)f8 | 1), (void*)t1_detour, &tr8), "T8 (T32) vldr-literal refused (fail closed)");
+    CHECK(f8[0] == 0x9F && f8[1] == 0xED, "T8 target left unmodified after refusal");
+
     printf(fails ? "\nHOOKTEST FAILED (%d failures)\n" : "\nHOOKTEST OK\n", fails);
     return fails ? 1 : 0;
 }
