@@ -251,6 +251,21 @@ static const CurlSig kUrlSetSigs[] = {
     { "\xf3\x0f\x1e\xfa\x55\x48\x89\xe5\x41\x57\x41\x56", "xxxxxxxxxxxx" },
     { "\x55\x48\x89\xe5\x41\x57\x41\x56",                 "xxxxxxxx"     },
 };
+#elif defined(__i386__)
+// Best-effort, frame-pointer __cdecl prologues (CET endbr32 variant + plain), to
+// be evidence-refined against a stripped i386 libcurl. A frameless build
+// (-fomit-frame-pointer) is resolved by .symtab instead; this scan only matters
+// for a stripped static curl, exactly as on the 64-bit ports.
+static const CurlSig kSetoptSigs[] = {
+    // endbr32; push ebp; mov ebp,esp
+    { "\xf3\x0f\x1e\xfb\x55\x89\xe5", "xxxxxxx" },
+    { "\x55\x89\xe5",                 "xxx"     },
+};
+static const CurlSig kUrlSetSigs[] = {
+    // endbr32; push ebp; mov ebp,esp; push edi; push esi
+    { "\xf3\x0f\x1e\xfb\x55\x89\xe5\x57\x56", "xxxxxxxxx" },
+    { "\x55\x89\xe5\x57\x56",                 "xxxxx"     },
+};
 #else /* __aarch64__ */
 static const CurlSig kSetoptSigs[] = {
     // GCC/Clang with pointer auth (the distro default): paciasp; sub sp,sp,#imm.

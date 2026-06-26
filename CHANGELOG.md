@@ -4,6 +4,12 @@ All notable changes to **Fragment** are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **i386 (IA-32) engine backend** (`common/arch/i386/decode.h`) unlocking **`linux-i386`** (and, later, `windows-x86`) from one decoder. The x86 prologue length-decoder is now a single mode-parameterized core (`common/arch/x86/decode.h`, `FR_X86_BITS` ∈ {32, 64}) that both `x86_64/decode.h` and `i386/decode.h` select into, so a decode fix lands for every x86 width at once and the 64-bit ports' include path is unchanged. The IA-32 deltas: `0x40`–`0x4F` decode as `INC/DEC reg` (no REX prefix), a bare `disp32` is an absolute address that copies verbatim (no RIP-relative form), a `mov`-immediate is never REX.W-widened, the stack-protector `mov eax, gs:0x14` canary (`moffs32`) is decoded, and 16-bit operand/address overrides (`0x66` rel16 / `0x67`) fail closed rather than mis-length.
+- **i386 inline-hook glue** (`linux/hook.h`): an `E9 rel32` patch — which reaches the whole 4 GB on IA-32, so there is no near-allocation limit — to a relay whose absolute jump is a register-free `push imm32; ret`, plus a `__cdecl` caller stub (`linux/util.h`) that builds a fresh, 16-byte-aligned call frame to prepend the per-hook context the shared C detour expects.
+- **ELF-class-agnostic symbol resolution** — `ElfFindSym` now reads either ELF class through `ElfW(...)`, so a 32-bit Fragment resolves a 32-bit module's `.symtab` / `.dynsym` while the 64-bit ports stay byte-for-byte unchanged.
+- A **native decoder unit test** (`linux/test/decodetest.c`) that checks instruction length, relocation metadata, and fail-closed refusal for both x86 widths without executing the bytes — so the x86-64 decoder is regression-guarded even where `qemu-x86_64` is absent — and an **i386 leg** in `test/build_test.sh` / `test/run.py` that runs the engine unit test, mock interposition, and the static `.symtab` inline-hook under `qemu-i386`.
+
 ## [1.1.0] - 2026-06-26
 
 ### Added

@@ -16,6 +16,10 @@ if [ "$MODE" = "x64" ]; then
     CC="${CROSS_CC:-x86_64-linux-gnu-gcc}"
     OUT="$ROOT/build/x64"
     BP=""
+elif [ "$MODE" = "i386" ]; then
+    CC="${CROSS_CC:-i686-linux-gnu-gcc}"
+    OUT="$ROOT/build/i386"
+    BP=""
 else
     CC="${CC:-cc}"
     OUT="$ROOT/build"
@@ -41,13 +45,19 @@ $CC $W "$HERE/host_mock.c" -o "$OUT/host_mock" -L"$OUT" -lmockcurl -Wl,-rpath,"$
 # direct (not a preemptible PLT entry), exactly like a statically-linked curl.
 $CC $W -no-pie "$HERE/host_mock.c" "$HERE/mockcurl.c" -o "$OUT/host_mock_static"
 
-if [ "$MODE" = "x64" ]; then
-    # Cross-build libfragment.so for x86-64 so the qemu subset can preload it.
+if [ "$MODE" = "x64" ] || [ "$MODE" = "i386" ]; then
+    # Cross-build libfragment.so so the qemu subset can preload it.
     $CC $W -fPIC -fvisibility=hidden -shared "$ROOT/main.c" \
         -o "$OUT/libfragment.so" -ldl -lpthread -Wl,-z,nodelete
-    echo "== x64 test binaries built in $OUT =="
+    echo "== $MODE test binaries built in $OUT =="
     exit 0
 fi
+
+# Decoder unit test, host-native, for BOTH x86 widths: pure byte arithmetic
+# (it never executes the bytes it decodes), so it regression-checks the x86-64
+# decoder and exercises the i386 one on any host -- no qemu needed.
+$CC $W -DFR_DT_BITS=64 "$HERE/decodetest.c" -o "$OUT/decodetest64"
+$CC $W -DFR_DT_BITS=32 "$HERE/decodetest.c" -o "$OUT/decodetest32"
 
 # ---- native-only: the real-libcurl hosts (need -lcurl) --------------------
 if echo 'int main(void){return 0;}' | $CC -xc - -lcurl -o /dev/null 2>/dev/null; then

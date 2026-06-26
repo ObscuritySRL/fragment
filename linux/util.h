@@ -12,6 +12,19 @@
 #include "curl.h"
 #include "hook.h"
 
+/* The symbol-table walk serves whichever ELF class the build is: ElfW(...) picks
+ * the Elf32_/Elf64_ structures by the native word size, so a 32-bit Fragment
+ * reads a 32-bit module and a 64-bit one a 64-bit module (a process and its
+ * modules are always the same class). The 64-bit ports are unaffected --
+ * ElfW(Ehdr) is Elf64_Ehdr there, and ST_TYPE extraction is identical math. */
+#if __ELF_NATIVE_CLASS == 32
+#define FR_ELFCLASS  ELFCLASS32
+#define FR_ST_TYPE(i) ELF32_ST_TYPE(i)
+#else
+#define FR_ELFCLASS  ELFCLASS64
+#define FR_ST_TYPE(i) ELF64_ST_TYPE(i)
+#endif
+
 // Resolve `name` to a runtime address via an object's on-disk symbol table.
 // Reads BOTH .symtab (a statically-linked function, no dynamic symbol) and
 // .dynsym (a real shared libcurl) -- an exact name match, immune to symbol
@@ -24,7 +37,7 @@ static void* ElfFindSym(const char* path, uintptr_t loadBias, const char* name) 
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return NULL;
     struct stat stt;
-    if (fstat(fd, &stt) != 0 || (size_t) stt.st_size < sizeof(Elf64_Ehdr)) { close(fd); return NULL; }
+    if (fstat(fd, &stt) != 0 || (size_t) stt.st_size < sizeof(ElfW(Ehdr))) { close(fd); return NULL; }
     size_t fsize = (size_t) stt.st_size;
     const uint8_t* base = (const uint8_t*) mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
@@ -32,25 +45,25 @@ static void* ElfFindSym(const char* path, uintptr_t loadBias, const char* name) 
 
     void* result = NULL;
     size_t namelen = strlen(name);
-    const Elf64_Ehdr* eh = (const Elf64_Ehdr*) base;
-    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 || eh->e_ident[EI_CLASS] != ELFCLASS64) goto done;
+    const ElfW(Ehdr)* eh = (const ElfW(Ehdr)*) base;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 || eh->e_ident[EI_CLASS] != FR_ELFCLASS) goto done;
     /* All bounds use subtraction-form comparisons so an oversized field can
      * never wrap past fsize and bypass the check. */
     if (eh->e_shoff == 0 || eh->e_shoff > fsize ||
-        (size_t) eh->e_shnum * sizeof(Elf64_Shdr) > fsize - eh->e_shoff) goto done;
-    const Elf64_Shdr* sh = (const Elf64_Shdr*) (base + eh->e_shoff);
+        (size_t) eh->e_shnum * sizeof(ElfW(Shdr)) > fsize - eh->e_shoff) goto done;
+    const ElfW(Shdr)* sh = (const ElfW(Shdr)*) (base + eh->e_shoff);
     for (int i = 0; i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) continue;
         if (sh[i].sh_link >= eh->e_shnum) continue;
         if (sh[i].sh_offset > fsize || sh[i].sh_size > fsize - sh[i].sh_offset) continue;
-        const Elf64_Shdr* strsh = &sh[sh[i].sh_link];   /* the linked string table */
+        const ElfW(Shdr)* strsh = &sh[sh[i].sh_link];   /* the linked string table */
         if (strsh->sh_offset > fsize || strsh->sh_size > fsize - strsh->sh_offset) continue;
-        const Elf64_Sym* sym = (const Elf64_Sym*) (base + sh[i].sh_offset);
-        size_t nsym = sh[i].sh_size / sizeof(Elf64_Sym);
+        const ElfW(Sym)* sym = (const ElfW(Sym)*) (base + sh[i].sh_offset);
+        size_t nsym = sh[i].sh_size / sizeof(ElfW(Sym));
         const char* str = (const char*) (base + strsh->sh_offset);
         size_t strsz = strsh->sh_size;
         for (size_t k = 0; k < nsym; k++) {
-            if (sym[k].st_value == 0 || ELF64_ST_TYPE(sym[k].st_info) != STT_FUNC) continue;
+            if (sym[k].st_value == 0 || FR_ST_TYPE(sym[k].st_info) != STT_FUNC) continue;
             size_t no = sym[k].st_name;
             /* Bound the name within the string table before comparing, so a
              * bad st_name can never walk strcmp off the end of the mapping. */
@@ -130,7 +143,7 @@ static void* EmitStub(const uint8_t* code, size_t len) {
  * hook by having the stub prepend a per-hook context pointer as the detour's
  * first argument (so the detour can reach the right trampoline + URL-API). The
  * incoming arguments are shifted right one slot; the calling convention is the
- * platform's (System V on x86-64, AAPCS64 on aarch64).
+ * platform's (System V on x86-64, __cdecl on i386, AAPCS64 on aarch64).
  *
  * curl_easy_setopt is variadic, but every real option value is a single
  * general-purpose word, so the stub forwards exactly one (curl, option, value)
@@ -165,6 +178,57 @@ static CurlUrlSetFn GenerateUrlSetCaller(void* pContext, void* pCalled) {
     };
     memcpy(code + 13, &pContext, sizeof(pContext));
     memcpy(code + 23, &pCalled, sizeof(pCalled));
+    return (CurlUrlSetFn) EmitStub(code, sizeof(code));
+}
+
+#elif defined(__i386__)
+static CurlSetoptFn GenerateCaller(void* pFirstParam, void* pCalled) {
+    // __cdecl passes everything on the stack, so we cannot prepend the context
+    // by a register shuffle as on x86-64; we build a fresh call frame instead.
+    // Frame: save ebp, then `and esp,-16` realigns to the 16-byte boundary the
+    // SysV i386 ABI requires (the gcc-built detour may use aligned SSE), re-push
+    // (curl, option, value) from the saved frame, prepend the context, and call
+    // the shared C detour. `leave; ret` tears the frame down and returns to the
+    // original caller (cdecl: the caller pops the original args).
+    uint8_t code[] = {
+        0x55,                                           // push ebp
+        0x89, 0xE5,                                     // mov ebp, esp
+        0x83, 0xE4, 0xF0,                               // and esp, -16
+        0xFF, 0x75, 0x10,                               // push [ebp+16]  (value)
+        0xFF, 0x75, 0x0C,                               // push [ebp+12]  (option)
+        0xFF, 0x75, 0x08,                               // push [ebp+8]   (curl)
+        0x68, 0,0,0,0,                                  // push <ctx>
+        0xB8, 0,0,0,0,                                  // mov eax, <detour>
+        0xFF, 0xD0,                                     // call eax
+        0xC9,                                           // leave
+        0xC3,                                           // ret
+    };
+    memcpy(code + 16, &pFirstParam, sizeof(pFirstParam));
+    memcpy(code + 21, &pCalled, sizeof(pCalled));
+    return (CurlSetoptFn) EmitStub(code, sizeof(code));
+}
+
+// Caller stub for the 4-argument curl_url_set(handle, what, part, flags); shifts
+// the args right one slot and passes flags as the detour's 5th argument. The
+// extra `sub esp,12` keeps the five pushed dwords 16-byte aligned at the call.
+static CurlUrlSetFn GenerateUrlSetCaller(void* pContext, void* pCalled) {
+    uint8_t code[] = {
+        0x55,                                           // push ebp
+        0x89, 0xE5,                                     // mov ebp, esp
+        0x83, 0xE4, 0xF0,                               // and esp, -16
+        0x83, 0xEC, 0x0C,                               // sub esp, 12
+        0xFF, 0x75, 0x14,                               // push [ebp+20]  (flags)
+        0xFF, 0x75, 0x10,                               // push [ebp+16]  (part)
+        0xFF, 0x75, 0x0C,                               // push [ebp+12]  (what)
+        0xFF, 0x75, 0x08,                               // push [ebp+8]   (handle)
+        0x68, 0,0,0,0,                                  // push <ctx>
+        0xB8, 0,0,0,0,                                  // mov eax, <detour>
+        0xFF, 0xD0,                                     // call eax
+        0xC9,                                           // leave
+        0xC3,                                           // ret
+    };
+    memcpy(code + 22, &pContext, sizeof(pContext));
+    memcpy(code + 27, &pCalled, sizeof(pCalled));
     return (CurlUrlSetFn) EmitStub(code, sizeof(code));
 }
 

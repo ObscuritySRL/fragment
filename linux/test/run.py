@@ -32,6 +32,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 X64 = os.path.join(BUILD, "x64")
+I386 = os.path.join(BUILD, "i386")
 LIBFRAG = os.path.join(BUILD, "libfragment.so")
 FRAGMENT = os.path.join(BUILD, "fragment")
 
@@ -204,6 +205,8 @@ def main():
     have_syscurl = shutil.which("curl") is not None
     qemu = shutil.which("qemu-x86_64-static") or shutil.which("qemu-x86_64")
     have_x64cc = shutil.which("x86_64-linux-gnu-gcc") is not None
+    qemu_i386 = shutil.which("qemu-i386-static") or shutil.which("qemu-i386")
+    have_i386cc = shutil.which("i686-linux-gnu-gcc") is not None
 
     HOST = os.path.join(BUILD, "host")
     HOST_URLAPI = os.path.join(BUILD, "host_urlapi")
@@ -219,6 +222,18 @@ def main():
     rc, out = run_cmd([os.path.join(BUILD, "hooktest")], 30)
     plain("hook engine unit test (native)", "PASS" if rc == 0 else "FAIL",
           "engine self-tests passed" if rc == 0 else "FAILED rc=%s\n%s" % (rc, out[-1500:]))
+
+    # --- decoder unit test (no execution): both x86 widths checked natively, so
+    #     the x86-64 decoder is regression-guarded even where qemu-x86_64 is
+    #     absent, and the i386 decoder gets a non-vacuous reloc + fail-closed test.
+    for bits, exe in (("x86-64", "decodetest64"), ("i386", "decodetest32")):
+        path = os.path.join(BUILD, exe)
+        if not os.path.exists(path):
+            plain("decoder unit test (%s, native)" % bits, "SKIP", "not built")
+            continue
+        rc, out = run_cmd([path], 30)
+        plain("decoder unit test (%s, native)" % bits, "PASS" if rc == 0 else "FAIL",
+              "length + reloc metadata + fail-closed" if rc == 0 else "FAILED rc=%s\n%s" % (rc, out[-1200:]))
 
     # --- mock-libcurl integration (no servers/curl): rewrite/idempotency/drop
     #     proven directly from what a mock libcurl received after interposition.
@@ -361,6 +376,26 @@ def main():
                   "ok" if rc == 0 else "rc=%s\n%s" % (rc, out[-1200:]))
     else:
         plain("x86-64 subset (qemu)", "SKIP", "qemu-x86_64 / x86-64 cross toolchain not present")
+
+    # --- i386 subset under qemu: engine + interposition + static inline hook,
+    #     the same self-contained subset the x86-64 leg runs (no 32-bit libcurl
+    #     needed). The shared engine's i386 backend + the __cdecl caller stub.
+    if qemu_i386 and have_i386cc:
+        if cmd_build(os.path.join("test", "build_test.sh"), "i386"):
+            qrun = [qemu_i386]
+            qenv = {"QEMU_LD_PREFIX": "/usr/i686-linux-gnu"}
+            rc, out = run_cmd(qrun + [os.path.join(I386, "hooktest")], 60, env=qenv)
+            plain("i386 engine unit test (qemu)", "PASS" if rc == 0 else "FAIL",
+                  "ok" if rc == 0 else "rc=%s\n%s" % (rc, out[-1200:]))
+            e = dict(qenv); e["LD_PRELOAD"] = os.path.join(I386, "libfragment.so")
+            rc, out = run_cmd(qrun + [os.path.join(I386, "host_mock")], 60, env=e)
+            plain("i386 mock interposition (qemu)", "PASS" if rc == 0 else "FAIL",
+                  "ok" if rc == 0 else "rc=%s\n%s" % (rc, out[-1200:]))
+            rc, out = run_cmd(qrun + [os.path.join(I386, "host_mock_static")], 60, env=e)
+            plain("i386 static inline hook (qemu)", "PASS" if rc == 0 else "FAIL",
+                  "ok" if rc == 0 else "rc=%s\n%s" % (rc, out[-1200:]))
+    else:
+        plain("i386 subset (qemu)", "SKIP", "qemu-i386 / i386 cross toolchain not present")
 
     for s in srvs:
         s.shutdown()
