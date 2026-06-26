@@ -20,6 +20,10 @@ elif [ "$MODE" = "i386" ]; then
     CC="${CROSS_CC:-i686-linux-gnu-gcc}"
     OUT="$ROOT/build/i386"
     BP=""
+elif [ "$MODE" = "armv7" ]; then
+    CC="${CROSS_CC:-arm-linux-gnueabihf-gcc}"
+    OUT="$ROOT/build/armv7"
+    BP=""
 else
     CC="${CC:-cc}"
     OUT="$ROOT/build"
@@ -45,7 +49,7 @@ $CC $W "$HERE/host_mock.c" -o "$OUT/host_mock" -L"$OUT" -lmockcurl -Wl,-rpath,"$
 # direct (not a preemptible PLT entry), exactly like a statically-linked curl.
 $CC $W -no-pie "$HERE/host_mock.c" "$HERE/mockcurl.c" -o "$OUT/host_mock_static"
 
-if [ "$MODE" = "x64" ] || [ "$MODE" = "i386" ]; then
+if [ "$MODE" = "x64" ] || [ "$MODE" = "i386" ] || [ "$MODE" = "armv7" ]; then
     # Cross-build libfragment.so so the qemu subset can preload it.
     $CC $W -fPIC -fvisibility=hidden -shared "$ROOT/main.c" \
         -o "$OUT/libfragment.so" -ldl -lpthread -Wl,-z,nodelete

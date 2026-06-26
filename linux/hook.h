@@ -9,8 +9,8 @@
 #include <sys/mman.h>
 #include "log.h"
 
-#if !defined(__x86_64__) && !defined(__i386__) && !defined(__aarch64__)
-#error "Fragment's hook engine (caller stubs, prologue decoder, patch) is x86-64 / i386 / aarch64 only."
+#if !defined(__x86_64__) && !defined(__i386__) && !defined(__aarch64__) && !defined(__arm__)
+#error "Fragment's hook engine (caller stubs, prologue decoder, patch) is x86-64 / i386 / aarch64 / armv7 only."
 #endif
 
 /*
@@ -61,8 +61,10 @@
 /* ---- near-block allocation ------------------------------------------------ */
 #if defined(__x86_64__) || defined(__i386__)
 #define FR_REACH 0x7FFF0000ULL     /* stay safely under 2 GB (E9 rel32)     */
-#else
+#elif defined(__aarch64__)
 #define FR_REACH 0x07FF0000ULL     /* stay safely under 128 MB (B imm26)    */
+#else  /* __arm__ */
+#define FR_REACH 0x00FF0000ULL     /* stay safely under 16 MB (T32 B.W)     */
 #endif
 
 /* ---- installed-hook registry (for clean teardown) ---------------------- */
@@ -147,7 +149,10 @@ static void* FrTrampolineFor(void* target) {
     void* tramp = NULL;
     pthread_mutex_lock(&gFrLock);
     for (FrHook* h = gFrHooks; h; h = h->next)
-        if (h->target == target) { tramp = h->block; break; }  /* block start == trampoline */
+        if (h->target == target) {                  /* block start == trampoline */
+            tramp = (void*)((uintptr_t)h->block | ((uintptr_t)h->target & 1));  /* carry the Thumb bit (no-op elsewhere) */
+            break;
+        }
     pthread_mutex_unlock(&gFrLock);
     return tramp;
 }
@@ -440,6 +445,135 @@ static int InstallHook(void* target, void* detour, void** outTramp) {
     return 1;
 }
 
+#elif defined(__arm__)
+/* ===== armv7 backend: relocation shared in common/arch/armv7 =========== */
+#include "../common/arch/armv7/reloc.h"
+
+/* Write the relay's absolute jump: a PC literal load (A32 or T32) followed by
+ * the detour word, which carries the detour's own state in bit 0. */
+static void FrWriteRelay(uint8_t* p, int thumb, uint32_t detour) {
+    if (thumb) {
+        uint16_t ldr1 = 0xF8DF, ldr2 = 0xF000;     /* ldr.w pc, [pc]   */
+        memcpy(p + 0, &ldr1, 2); memcpy(p + 2, &ldr2, 2);
+    } else {
+        uint32_t ldr = 0xE51FF004u;                 /* ldr pc, [pc, #-4] */
+        memcpy(p + 0, &ldr, 4);
+    }
+    memcpy(p + 4, &detour, 4);
+}
+
+static int InstallHook(void* target, void* detour, void** outTramp) {
+    int thumb = (int)((uintptr_t)target & 1);
+    uint8_t* tgt = (uint8_t*)((uintptr_t)target & ~(uintptr_t)1);
+    if (!thumb && ((uintptr_t)tgt & 3)) { LogError("[hook] A32 target not 4-aligned @ %p\n", target); return 0; }
+
+    /* 1. measure whole instructions covering >= 4 bytes (one A32 word, or one or
+     *    two T32 halfword instructions). */
+    int lens[4], n = 0, copyLen = 0;
+    while (copyLen < 4) {
+        if (n >= 4) { LogError("[hook] prologue too long @ %p\n", target); return 0; }
+        int l = thumb ? FrThumbLen(tgt + copyLen) : 4;
+        lens[n++] = l; copyLen += l;
+    }
+    if (copyLen > 8) { LogError("[hook] prologue copy too large (%d) @ %p\n", copyLen, target); return 0; }
+
+    /* 2. allocate the near block: [trampoline][literal pool][relay]. The pool and
+     *    relay sit at 4-aligned offsets so a relocated `ldr` literal and the T32
+     *    `ldr.w pc,[pc]` resolve. */
+    size_t trampLen  = (size_t)copyLen + 4;             /* prologue + B(.W) back */
+    size_t poolOff   = (trampLen + 3) & ~(size_t)3;
+    size_t relayOff  = poolOff + 16;                    /* 16-byte literal pool   */
+    size_t blockSize = relayOff + 8;
+    uint8_t* block = (uint8_t*)FrAllocNear(target, blockSize);
+    if (!block) { LogError("[hook] no free memory within reach of %p\n", target); return 0; }
+    uint8_t* tramp = block;
+    uint8_t* relay = block + relayOff;
+    FrPool pool = { block + poolOff, (uintptr_t)(block + poolOff), 0, 16 };
+
+    /* 3. copy + relocate the prologue into the trampoline, then a branch back. */
+    int off = 0;
+    for (int k = 0; k < n; k++) {
+        if (thumb) {
+            if (!FrRelocThumb(tgt + off, lens[k], (uintptr_t)(tgt + off), (uintptr_t)(tramp + off), tramp + off, &pool)) {
+                munmap(block, blockSize);
+                LogError("[hook] un-relocatable T32 prologue @ %p+%d; refusing\n", target, off);
+                return 0;
+            }
+        } else {
+            uint32_t insn; memcpy(&insn, tgt + off, 4);
+            uint32_t reloc;
+            if (!FrRelocArm(insn, (uintptr_t)(tgt + off), (uintptr_t)(tramp + off), &reloc, &pool)) {
+                munmap(block, blockSize);
+                LogError("[hook] un-relocatable A32 prologue insn 0x%08x @ %p; refusing\n", insn, target);
+                return 0;
+            }
+            memcpy(tramp + off, &reloc, 4);
+        }
+        off += lens[k];
+    }
+    if (thumb) {
+        if (!FrInRangeThumbBW((uintptr_t)(tramp + copyLen), (uintptr_t)(tgt + copyLen))) {
+            munmap(block, blockSize); LogError("[hook] trampoline out of B.W range @ %p; refusing\n", target); return 0;
+        }
+        FrEncThumbBW((uintptr_t)(tramp + copyLen), (uintptr_t)(tgt + copyLen), tramp + copyLen);
+    } else {
+        if (!FrInRangeArmB((uintptr_t)(tramp + copyLen), (uintptr_t)(tgt + copyLen))) {
+            munmap(block, blockSize); LogError("[hook] trampoline out of B range @ %p; refusing\n", target); return 0;
+        }
+        uint32_t bb = FrEncArmB((uintptr_t)(tramp + copyLen), (uintptr_t)(tgt + copyLen), 0xE);
+        memcpy(tramp + copyLen, &bb, 4);
+    }
+
+    /* relay: the absolute jump to the detour. The patch branch must reach it. */
+    FrWriteRelay(relay, thumb, (uint32_t)(uintptr_t)detour);
+    int reachable = thumb ? FrInRangeThumbBW((uintptr_t)tgt, (uintptr_t)relay)
+                          : FrInRangeArmB((uintptr_t)tgt, (uintptr_t)relay);
+    if (!reachable) { munmap(block, blockSize); LogError("[hook] relay out of branch range from %p; refusing\n", target); return 0; }
+
+    if (!FrProtect(block, blockSize, PROT_READ | PROT_EXEC)) { munmap(block, blockSize); LogError("[hook] mprotect(block) failed\n"); return 0; }
+    __builtin___clear_cache((char*)block, (char*)block + blockSize);
+
+    /* 4. patch the target: a single 4-byte branch to the relay, T32-NOP-filling
+     * any orphaned tail of the last copied instruction (copyLen is 4 or 6). The
+     * write is not atomic (a T32 prologue may be only 2-aligned), but the torn
+     * window is benign in Fragment's flow -- hooks land before curl is exercised. */
+    if (!FrProtect(tgt, (size_t)copyLen, PROT_READ | PROT_WRITE)) { munmap(block, blockSize); LogError("[hook] mprotect(target) failed\n"); return 0; }
+
+    /* Record the hook (capturing the ORIGINAL bytes, and the original pointer
+     * WITH its Thumb bit for dedup) BEFORE patching. */
+    FrHook* h = (FrHook*)FrHeapAlloc(sizeof(FrHook));
+    if (!h) {
+        FrProtect(tgt, (size_t)copyLen, PROT_READ | PROT_EXEC);
+        munmap(block, blockSize);
+        LogError("[hook] out of memory recording hook @ %p\n", target);
+        return 0;
+    }
+    h->target = target; h->block = block; h->blockSize = blockSize;
+    h->savedLen = (size_t)copyLen;
+    memcpy(h->saved, tgt, (size_t)copyLen);
+
+    if (thumb) {
+        FrEncThumbBW((uintptr_t)tgt, (uintptr_t)relay, tgt);
+        for (int b = 4; b < copyLen; b += 2) { uint16_t nop = 0xBF00; memcpy(tgt + b, &nop, 2); }  /* T32 NOP */
+    } else {
+        uint32_t pb = FrEncArmB((uintptr_t)tgt, (uintptr_t)relay, 0xE);
+        memcpy(tgt, &pb, 4);
+    }
+
+    FrProtect(tgt, (size_t)copyLen, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char*)tgt, (char*)tgt + copyLen);
+
+    HookEngineInit();
+    pthread_mutex_lock(&gFrLock);
+    h->next = gFrHooks; gFrHooks = h;
+    pthread_mutex_unlock(&gFrLock);
+
+    *outTramp = (void*)((uintptr_t)tramp | (uintptr_t)thumb);   /* callable: carry the Thumb bit */
+    LogDebug("[hook] installed @ %p %s copyLen=%d block=%p tramp=%p relay=%p\n",
+             target, thumb ? "T32" : "A32", copyLen, (void*)block, (void*)tramp, (void*)relay);
+    return 1;
+}
+
 #else
 /* ===== aarch64 backend: relocation shared in common/arch/aarch64 ======= */
 #include "../common/arch/aarch64/reloc.h"
@@ -533,10 +667,13 @@ static void HookEngineShutdown(void) {
     pthread_mutex_lock(&gFrLock);
     FrHook* h = gFrHooks;
     while (h) {
-        if (FrProtect(h->target, h->savedLen, PROT_READ | PROT_WRITE)) {
-            memcpy(h->target, h->saved, h->savedLen);
-            FrProtect(h->target, h->savedLen, PROT_READ | PROT_EXEC);
-            __builtin___clear_cache((char*)h->target, (char*)h->target + h->savedLen);
+        /* mask any Thumb state bit so the bytes land at the real address (a
+         * no-op on x86 / aarch64, where the target is never odd). */
+        void* t = (void*)((uintptr_t)h->target & ~(uintptr_t)1);
+        if (FrProtect(t, h->savedLen, PROT_READ | PROT_WRITE)) {
+            memcpy(t, h->saved, h->savedLen);
+            FrProtect(t, h->savedLen, PROT_READ | PROT_EXEC);
+            __builtin___clear_cache((char*)t, (char*)t + h->savedLen);
         }
         if (h->block) munmap(h->block, h->blockSize);
         FrHook* nx = h->next;

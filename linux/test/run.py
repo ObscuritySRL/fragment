@@ -33,6 +33,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 X64 = os.path.join(BUILD, "x64")
 I386 = os.path.join(BUILD, "i386")
+ARMV7 = os.path.join(BUILD, "armv7")
 LIBFRAG = os.path.join(BUILD, "libfragment.so")
 FRAGMENT = os.path.join(BUILD, "fragment")
 
@@ -207,6 +208,8 @@ def main():
     have_x64cc = shutil.which("x86_64-linux-gnu-gcc") is not None
     qemu_i386 = shutil.which("qemu-i386-static") or shutil.which("qemu-i386")
     have_i386cc = shutil.which("i686-linux-gnu-gcc") is not None
+    qemu_arm = shutil.which("qemu-arm-static") or shutil.which("qemu-arm")
+    have_armcc = shutil.which("arm-linux-gnueabihf-gcc") is not None
 
     HOST = os.path.join(BUILD, "host")
     HOST_URLAPI = os.path.join(BUILD, "host_urlapi")
@@ -396,6 +399,27 @@ def main():
                   "ok" if rc == 0 else "rc=%s\n%s" % (rc, out[-1200:]))
     else:
         plain("i386 subset (qemu)", "SKIP", "qemu-i386 / i386 cross toolchain not present")
+
+    # --- armv7 subset under qemu: engine (A32 + T32 reloc / fail-closed) + mock
+    #     interposition + static .symtab inline hook. The shared engine's armv7
+    #     backend + the AAPCS caller stub; no 32-bit arm libcurl on the box, so
+    #     the real-libcurl rows SKIP as on the i386 / x86-64 qemu subsets.
+    if qemu_arm and have_armcc:
+        if cmd_build(os.path.join("test", "build_test.sh"), "armv7"):
+            qrun = [qemu_arm]
+            qenv = {"QEMU_LD_PREFIX": "/usr/arm-linux-gnueabihf"}
+            rc, out = run_cmd(qrun + [os.path.join(ARMV7, "hooktest")], 60, env=qenv)
+            plain("armv7 engine unit test (qemu)", "PASS" if rc == 0 else "FAIL",
+                  "ok" if rc == 0 else "rc=%s\n%s" % (rc, out[-1200:]))
+            e = dict(qenv); e["LD_PRELOAD"] = os.path.join(ARMV7, "libfragment.so")
+            rc, out = run_cmd(qrun + [os.path.join(ARMV7, "host_mock")], 60, env=e)
+            plain("armv7 mock interposition (qemu)", "PASS" if rc == 0 else "FAIL",
+                  "ok" if rc == 0 else "rc=%s\n%s" % (rc, out[-1200:]))
+            rc, out = run_cmd(qrun + [os.path.join(ARMV7, "host_mock_static")], 60, env=e)
+            plain("armv7 static inline hook (qemu)", "PASS" if rc == 0 else "FAIL",
+                  "ok" if rc == 0 else "rc=%s\n%s" % (rc, out[-1200:]))
+    else:
+        plain("armv7 subset (qemu)", "SKIP", "qemu-arm / arm cross toolchain not present")
 
     for s in srvs:
         s.shutdown()

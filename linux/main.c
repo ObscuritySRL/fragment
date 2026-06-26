@@ -266,6 +266,22 @@ static const CurlSig kUrlSetSigs[] = {
     { "\xf3\x0f\x1e\xfb\x55\x89\xe5\x57\x56", "xxxxxxxxx" },
     { "\x55\x89\xe5\x57\x56",                 "xxxxx"     },
 };
+#elif defined(__arm__)
+// Best-effort frame-establishing prologues, to be evidence-refined against a
+// stripped arm libcurl: a T32 `push {..,lr}` (the toolchain default) and the A32
+// `stmdb sp!,{..,lr}` form (reglist masked). A frameless build is resolved by
+// .symtab instead; this scan only matters for a stripped static curl, as on the
+// other ports.
+static const CurlSig kSetoptSigs[] = {
+    { "\xf0\xb5",         "xx"   },     // T32: push {r4-r7, lr}
+    { "\x80\xb5",         "xx"   },     // T32: push {r7, lr}
+    { "\x00\x40\x2d\xe9", "?xxx" },     // A32: push {.., lr}
+};
+static const CurlSig kUrlSetSigs[] = {
+    { "\xf0\xb5",         "xx"   },
+    { "\x80\xb5",         "xx"   },
+    { "\x00\x40\x2d\xe9", "?xxx" },
+};
 #else /* __aarch64__ */
 static const CurlSig kSetoptSigs[] = {
     // GCC/Clang with pointer auth (the distro default): paciasp; sub sp,sp,#imm.

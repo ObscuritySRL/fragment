@@ -143,7 +143,8 @@ static void* EmitStub(const uint8_t* code, size_t len) {
  * hook by having the stub prepend a per-hook context pointer as the detour's
  * first argument (so the detour can reach the right trampoline + URL-API). The
  * incoming arguments are shifted right one slot; the calling convention is the
- * platform's (System V on x86-64, __cdecl on i386, AAPCS64 on aarch64).
+ * platform's (System V on x86-64, __cdecl on i386, AAPCS on armv7, AAPCS64 on
+ * aarch64).
  *
  * curl_easy_setopt is variadic, but every real option value is a single
  * general-purpose word, so the stub forwards exactly one (curl, option, value)
@@ -229,6 +230,48 @@ static CurlUrlSetFn GenerateUrlSetCaller(void* pContext, void* pCalled) {
     };
     memcpy(code + 22, &pContext, sizeof(pContext));
     memcpy(code + 27, &pCalled, sizeof(pCalled));
+    return (CurlUrlSetFn) EmitStub(code, sizeof(code));
+}
+
+#elif defined(__arm__)
+static CurlSetoptFn GenerateCaller(void* pFirstParam, void* pCalled) {
+    // AAPCS: r0-r3. Shift (curl, option, value) right one register, put the
+    // context in r0, and branch to the detour. Emitted as A32 and entered with
+    // bit 0 clear (the relay clears it), so it runs as ARM and interworks to the
+    // detour via the loaded word regardless of the .so's own state.
+    uint8_t code[] = {
+        0x02, 0x30, 0xA0, 0xE1,                         // mov r3, r2   (value)
+        0x01, 0x20, 0xA0, 0xE1,                         // mov r2, r1   (option)
+        0x00, 0x10, 0xA0, 0xE1,                         // mov r1, r0   (curl)
+        0x00, 0x00, 0x9F, 0xE5,                         // ldr r0, [pc]   -> ctx
+        0x00, 0xF0, 0x9F, 0xE5,                         // ldr pc, [pc]   -> detour
+        0,0,0,0,                                        // .word ctx
+        0,0,0,0,                                        // .word detour
+    };
+    memcpy(code + 20, &pFirstParam, sizeof(pFirstParam));
+    memcpy(code + 24, &pCalled, sizeof(pCalled));
+    return (CurlSetoptFn) EmitStub(code, sizeof(code));
+}
+
+// Caller stub for the 4-argument curl_url_set(handle, what, part, flags); shifts
+// the args right one slot and spills flags onto the stack as the detour's 5th
+// (AAPCS passes the fifth integer argument on the stack). push/pop keep the
+// 8-byte-aligned stack arg in place across the call.
+static CurlUrlSetFn GenerateUrlSetCaller(void* pContext, void* pCalled) {
+    uint8_t code[] = {
+        0x08, 0x40, 0x2D, 0xE9,                         // push {r3, lr}   (flags -> stack arg)
+        0x02, 0x30, 0xA0, 0xE1,                         // mov r3, r2   (part)
+        0x01, 0x20, 0xA0, 0xE1,                         // mov r2, r1   (what)
+        0x00, 0x10, 0xA0, 0xE1,                         // mov r1, r0   (handle)
+        0x08, 0x00, 0x9F, 0xE5,                         // ldr r0, [pc, #8]  -> ctx
+        0x08, 0xC0, 0x9F, 0xE5,                         // ldr ip, [pc, #8]  -> detour
+        0x3C, 0xFF, 0x2F, 0xE1,                         // blx ip
+        0x08, 0x80, 0xBD, 0xE8,                         // pop {r3, pc}
+        0,0,0,0,                                        // .word ctx
+        0,0,0,0,                                        // .word detour
+    };
+    memcpy(code + 32, &pContext, sizeof(pContext));
+    memcpy(code + 36, &pCalled, sizeof(pCalled));
     return (CurlUrlSetFn) EmitStub(code, sizeof(code));
 }
 

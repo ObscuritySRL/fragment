@@ -180,6 +180,79 @@ int main(void) {
     return fails ? 1 : 0;
 }
 
+#elif defined(__arm__)
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    HookEngineInit();
+
+    /* T1: A32 plain prologue (push {r4,lr}; mov r0,#0xAB; pop {r4,pc}). */
+    uint8_t t1[] = { 0x10,0x40,0x2D,0xE9, 0xAB,0x00,0xA0,0xE3, 0x10,0x80,0xBD,0xE8 };
+    uint8_t* f1 = make_fn(t1, sizeof(t1), NULL);
+    CHECK(f1 && ((fn0)f1)() == 0xAB, "T1 (A32) original returns 0xAB");
+    g_called = 0;
+    CHECK(InstallHook(f1, (void*)t1_detour, (void**)&t1_tramp), "T1 install (A32 plain prologue)");
+    CHECK(((fn0)f1)() == 0xAB, "T1 hooked still returns 0xAB via trampoline");
+    CHECK(g_called == 1, "T1 detour ran exactly once");
+
+    /* T2: T32 plain prologue (push {r4,lr}; movs r0,#0xCD; pop {r4,pc}). The
+     * Thumb bit (bit 0) is set in the callable pointer. */
+    uint8_t t2[] = { 0x10,0xB5, 0xCD,0x20, 0x10,0xBD };
+    uint8_t* f2b = make_fn(t2, sizeof(t2), NULL);
+    fn0 f2 = (fn0)((uintptr_t)f2b | 1);
+    CHECK(f2b && f2() == 0xCD, "T2 (T32) original returns 0xCD");
+    g_called = 0;
+    CHECK(InstallHook((void*)f2, (void*)t2_detour, (void**)&t2_tramp), "T2 install (T32 plain prologue)");
+    CHECK(f2() == 0xCD, "T2 hooked still returns 0xCD via trampoline");
+    CHECK(g_called == 1, "T2 detour ran exactly once");
+
+    /* T3: A32, first instruction is a B leaving the window -> B relocation. */
+    uint8_t t3[] = { 0x01,0x00,0x00,0xEA, 0xF0,0x00,0xF0,0xE7, 0xF0,0x00,0xF0,0xE7,
+                     0xCD,0x00,0xA0,0xE3, 0x1E,0xFF,0x2F,0xE1 };
+    uint8_t* f3 = make_fn(t3, sizeof(t3), NULL);
+    CHECK(((fn0)f3)() == 0xCD, "T3 (A32) original returns 0xCD");
+    g_called = 0;
+    CHECK(InstallHook(f3, (void*)t3_detour, (void**)&t3_tramp), "T3 install (A32 B-relative prologue)");
+    CHECK(((fn0)f3)() == 0xCD, "T3 trampoline B-reloc returns 0xCD");
+    CHECK(g_called == 1, "T3 detour ran exactly once");
+
+    /* T4: T32 LDR-literal prologue -- relocated through the trampoline literal
+     * pool (the loaded constant is copied and the load re-pointed). */
+    uint8_t t4[] = { 0x00,0x48, 0x70,0x47, 0xCD,0x00,0x00,0x00 };
+    uint8_t* f4b = make_fn(t4, sizeof(t4), NULL);
+    fn0 f4 = (fn0)((uintptr_t)f4b | 1);
+    CHECK(f4() == 0xCD, "T4 (T32) original loads literal 0xCD");
+    g_called = 0;
+    CHECK(InstallHook((void*)f4, (void*)t2_detour, (void**)&t2_tramp), "T4 install (T32 LDR-literal, pooled)");
+    CHECK(f4() == 0xCD, "T4 trampoline pooled-literal returns 0xCD");
+    CHECK(g_called == 1, "T4 detour ran exactly once");
+
+    /* T5: A32 LDR-literal prologue -- relocated through the literal pool too. */
+    uint8_t t5[] = { 0x00,0x00,0x9F,0xE5, 0x1E,0xFF,0x2F,0xE1, 0xCD,0x00,0x00,0x00 };
+    uint8_t* f5 = make_fn(t5, sizeof(t5), NULL);
+    CHECK(((fn0)f5)() == 0xCD, "T5 (A32) original loads literal 0xCD");
+    g_called = 0;
+    CHECK(InstallHook(f5, (void*)t3_detour, (void**)&t3_tramp), "T5 install (A32 LDR-literal, pooled)");
+    CHECK(((fn0)f5)() == 0xCD, "T5 trampoline pooled-literal returns 0xCD");
+    CHECK(g_called == 1, "T5 detour ran exactly once");
+
+    /* T6: T32 `add rd,pc` re-bases on PC and cannot be pooled -> fail closed. */
+    uint8_t t6[] = { 0x78,0x44, 0x70,0x47 };
+    uint8_t* f6 = make_fn(t6, sizeof(t6), NULL);
+    void* tr6 = NULL;
+    CHECK(!InstallHook((void*)((uintptr_t)f6 | 1), (void*)t1_detour, &tr6), "T6 (T32) add-pc refused (fail closed)");
+    CHECK(f6[0] == 0x78 && f6[1] == 0x44, "T6 target left unmodified after refusal");
+
+    /* T7: A32 ADR (add rd,pc,#imm) -> fail closed. */
+    uint8_t t7[] = { 0x04,0x00,0x8F,0xE2, 0x1E,0xFF,0x2F,0xE1 };
+    uint8_t* f7 = make_fn(t7, sizeof(t7), NULL);
+    void* tr7 = NULL;
+    CHECK(!InstallHook(f7, (void*)t1_detour, &tr7), "T7 (A32) ADR refused (fail closed)");
+    CHECK(f7[0] == 0x04 && f7[3] == 0xE2, "T7 target left unmodified after refusal");
+
+    printf(fails ? "\nHOOKTEST FAILED (%d failures)\n" : "\nHOOKTEST OK\n", fails);
+    return fails ? 1 : 0;
+}
+
 #else /* __aarch64__ */
 static int g_val = 0x1234;   /* read via an ADRP+LDR in T2 */
 
