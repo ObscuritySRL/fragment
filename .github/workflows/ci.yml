@@ -62,6 +62,55 @@ jobs:
           path: windows/build/Release/Fragment.dll
           if-no-files-found: error
 
+  windows-wow64:
+    # Cross-bitness injection end to end on a real WOW64-capable runner: a
+    # 64-bit fragment.exe injecting the 32-bit Fragment32.dll into a 32-bit
+    # target. The loader resolves the target's OWN 32-bit kernel32 LoadLibraryA
+    # (its own 64-bit one is the wrong image), and a passive 32-bit victim --
+    # which never loads Fragment itself -- reports whether its mock-libcurl call
+    # came back rewritten, so a PASS proves the injection took. A run of the same
+    # victim with no injection is the non-vacuous negative control.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build the x64 loader (fragment.exe)
+        shell: cmd
+        run: |
+          cmake -S windows -B windows/build64 -A x64 || exit /b 1
+          cmake --build windows/build64 --config Release || exit /b 1
+
+      - name: Set up MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build the 32-bit DLL + WOW64 fixtures
+        shell: cmd
+        run: |
+          cmake -S windows -B windows/build32 -A Win32 || exit /b 1
+          cmake --build windows/build32 --config Release || exit /b 1
+          copy /y windows\build32\Release\Fragment.dll windows\build64\Release\Fragment32.dll || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /LD windows\test\mockcurl.c /Fe:windows\build64\Release\mockcurl.dll /Fo:windows\build32\mockcurl.obj || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS    windows\test\victim.c   /Fe:windows\build64\Release\victim.exe  /Fo:windows\build32\victim.obj  || exit /b 1
+
+      - name: Cross-bitness inject (64-bit fragment.exe -> 32-bit Fragment32.dll)
+        shell: cmd
+        working-directory: windows/build64/Release
+        run: |
+          dir Fragment32.dll fragment.exe victim.exe mockcurl.dll
+          rem Non-vacuous negative control: an un-injected victim must NOT rewrite.
+          victim.exe mockcurl.dll
+          if %errorlevel% EQU 0 (echo NEG CONTROL FAILED: victim rewrote with no injection & exit /b 1)
+          echo negative control OK ^(un-injected victim did not rewrite^)
+          rem Launch + cross-bitness inject; victim exits 0 once a request is rewritten.
+          fragment.exe -- victim.exe mockcurl.dll
+          if %errorlevel% NEQ 0 (echo CROSS-BITNESS INJECT FAILED & exit /b 1)
+          echo cross-bitness inject OK
+
   linux:
     # Build and test natively on both Linux architectures the port supports.
     strategy:

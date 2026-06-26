@@ -69,19 +69,27 @@ static int read_remote(void* ctx, DWORD rva, void* dst, DWORD n) {
 
 /* Base of the target's 32-bit kernel32.dll. A snapshot taken with
  * TH32CS_SNAPMODULE32 lists the WOW64 (32-bit) modules of the target even from
- * this 64-bit process; 0 if it is not present yet. */
+ * this 64-bit process. An already-running target (--pid) has it on the first
+ * look; a freshly launched one only maps it once the WOW64 loader runs, so we
+ * poll briefly (the snapshot can also fail transiently while the list churns).
+ * 0 if it never appears. */
 static ULONG_PTR wow64_kernel32(DWORD pid) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
-    MODULEENTRY32 me = { sizeof(me) };
-    ULONG_PTR base = 0;
-    if (Module32First(snap, &me)) {
-        do {
-            if (!_stricmp(me.szModule, "kernel32.dll")) { base = (ULONG_PTR) me.modBaseAddr; break; }
-        } while (Module32Next(snap, &me));
+    for (int tries = 0; tries < 100; tries++) {       /* ~5s worst case, fail closed */
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snap != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32 me = { sizeof(me) };
+            ULONG_PTR base = 0;
+            if (Module32First(snap, &me)) {
+                do {
+                    if (!_stricmp(me.szModule, "kernel32.dll")) { base = (ULONG_PTR) me.modBaseAddr; break; }
+                } while (Module32Next(snap, &me));
+            }
+            CloseHandle(snap);
+            if (base) return base;
+        }
+        Sleep(50);
     }
-    CloseHandle(snap);
-    return base;
+    return 0;
 }
 
 /* Address of LoadLibraryA as the remote thread must see it. For a native x64
@@ -220,8 +228,15 @@ int main(int argc, char** argv) {
             CloseHandle(pi.hProcess);
             return 3;
         }
+        /* A WOW64 target must run far enough for its 32-bit kernel32 to map
+         * before we can resolve LoadLibraryA, so resume it first and let
+         * inject_into wait for the module (the hook still lands during the
+         * target's loader init); a native x64 target is injected while
+         * suspended -- its kernel32 is already at the known base -- and resumed
+         * after. Either way the thread is resumed exactly once. */
+        if (wow) ResumeThread(pi.hThread);
         int ok = inject_into(pi.hProcess, path, wow);
-        ResumeThread(pi.hThread);    /* resume regardless, so we never wedge the target */
+        if (!wow) ResumeThread(pi.hThread);
         if (ok) printf("[fragment] injected into pid %lu\n", pi.dwProcessId);
         else    fprintf(stderr, "[fragment] injection failed; target runs un-proxied\n");
         WaitForSingleObject(pi.hProcess, INFINITE);
