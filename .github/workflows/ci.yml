@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,35 +17,76 @@ jobs:
           arch: x64
 
       - name: Configure
-        run: cmake -S . -B build -A x64
+        run: cmake -S windows -B windows/build -A x64
 
       - name: Build Fragment.dll (Release)
-        run: cmake --build build --config Release
+        run: cmake --build windows/build --config Release
 
       - name: Build & run the hook-engine unit test
         shell: cmd
         run: |
-          cl /nologo /O2 /MD /W3 test\hooktest.c /Fe:build\hooktest.exe /Fo:build\hooktest.obj || exit /b 1
-          build\hooktest.exe || exit /b 1
+          cl /nologo /O2 /MD /W3 windows\test\hooktest.c /Fe:windows\build\hooktest.exe /Fo:windows\build\hooktest.obj || exit /b 1
+          windows\build\hooktest.exe || exit /b 1
 
       - name: Build & run the mock-libcurl integration test
         shell: cmd
         run: |
-          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /LD test\mockcurl.c /Fe:build\mockcurl.dll /Fo:build\mockcurl.obj || exit /b 1
-          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS test\host_mock.c    /Fe:build\host_mock.exe /Fo:build\host_mock.obj || exit /b 1
-          build\host_mock.exe build\Release\Fragment.dll build\mockcurl.dll || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /LD windows\test\mockcurl.c /Fe:windows\build\mockcurl.dll /Fo:windows\build\mockcurl.obj || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS windows\test\host_mock.c    /Fe:windows\build\host_mock.exe /Fo:windows\build\host_mock.obj || exit /b 1
+          windows\build\host_mock.exe windows\build\Release\Fragment.dll windows\build\mockcurl.dll || exit /b 1
 
       - name: Upload DLL artifact
         uses: actions/upload-artifact@v4
         with:
           name: Fragment-x64
-          path: build/Release/Fragment.dll
+          path: windows/build/Release/Fragment.dll
           if-no-files-found: error
 
-# NOTE: the full real-libcurl matrix (test/run.py) needs the third-party curl
-# corpus described in test/curl/README.md, which is intentionally not committed,
-# so it runs locally rather than in CI. CI proves, on a clean machine: a build,
-# the self-contained engine unit test (prologue relocation + fail-closed paths),
-# AND the mock-libcurl integration test -- which exercises the real injection +
-# export-resolution + curl_easy_setopt rewrite/idempotency/option-drop path
-# against a genuine (mock) libcurl DLL, with no third-party binaries.
+  linux:
+    # Build and test natively on both Linux architectures the port supports.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ ubuntu-latest, ubuntu-24.04-arm ]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake
+
+      - name: Build libfragment.so (Release)
+        working-directory: linux
+        run: ./build.sh Release
+
+      - name: Build & run the hook-engine unit test
+        working-directory: linux
+        run: |
+          cc -O2 -std=c17 -mbranch-protection=standard test/hooktest.c -o build/hooktest -lpthread 2>/dev/null \
+            || cc -O2 -std=c17 test/hooktest.c -o build/hooktest -lpthread
+          ./build/hooktest
+
+      - name: Build & run the mock + static-curl integration tests
+        working-directory: linux
+        run: |
+          cc -O2 -std=c17 -fPIC -shared test/mockcurl.c -o build/libmockcurl.so
+          cc -O2 -std=c17 test/host_mock.c -o build/host_mock -Lbuild -lmockcurl -Wl,-rpath,"$PWD/build"
+          cc -O2 -std=c17 -no-pie test/host_mock.c test/mockcurl.c -o build/host_mock_static
+          env -u FRAGMENT_PROXY LD_PRELOAD="$PWD/build/libfragment.so" ./build/host_mock
+          env -u FRAGMENT_PROXY LD_PRELOAD="$PWD/build/libfragment.so" ./build/host_mock_static
+
+      - name: Upload .so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libfragment-${{ runner.arch }}
+          path: linux/build/libfragment.so
+          if-no-files-found: error
+
+# NOTE: the full real-libcurl matrix (linux/test/run.py) drives the SYSTEM
+# libcurl + curl binary and a live ptrace injection; the ptrace row needs
+# kernel.yama.ptrace_scope=0 (or CAP_SYS_PTRACE), so the matrix is run locally
+# rather than in CI. CI proves, on a clean machine: a build of each OS, the
+# self-contained engine unit test (prologue relocation + fail-closed paths), AND
+# the mock-libcurl interposition + static-curl inline-hook tests -- which
+# exercise the real rewrite/idempotency/option-drop path against a genuine (mock)
+# libcurl, with no third-party binaries.

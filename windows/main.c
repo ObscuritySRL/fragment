@@ -5,6 +5,7 @@
 #include "config.h"
 #include "curl.h"
 #include "util.h"
+#include "../common/version.h"
 
 // Build "<proxyPrefix><orig>" (default http://127.0.0.1:9020/<orig>, but the
 // prefix is runtime-configurable). Returns NULL when no rewrite is needed
@@ -441,8 +442,8 @@ BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID lpvReserved) {
 
     DisableThreadLibraryCalls(hinstDLL);
     ConfigInit();
-    LogInfo("[Fragment] attach pid=%lu enabled=%d proxy=%s\n",
-            GetCurrentProcessId(), (int)gCfg.enabled, gCfg.proxyPrefix);
+    LogInfo("[Fragment] %s attach pid=%lu enabled=%d proxy=%s\n",
+            FRAGMENT_VERSION, GetCurrentProcessId(), (int)gCfg.enabled, gCfg.proxyPrefix);
     if (!gCfg.enabled) {
         LogInfo("[Fragment] disabled via environment; not hooking\n");
         return TRUE;

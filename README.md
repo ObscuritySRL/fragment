@@ -1,9 +1,9 @@
 # Fragment
 
-**Fragment** is a small Windows x64 DLL that transparently redirects a target
-process's [libcurl](https://curl.se/libcurl/) traffic through a local
-reverse-proxy. It injects into the process, hooks libcurl at its **API layer**,
-and rewrites every outbound request URL to
+**Fragment** transparently redirects a target process's
+[libcurl](https://curl.se/libcurl/) traffic through a local reverse-proxy. It
+intercepts libcurl at its **API layer** and rewrites every outbound request URL
+to
 
 ```
 http://127.0.0.1:9020/<original-url>
@@ -18,6 +18,19 @@ upstream (terminate TLS to the real host, inspect, rewrite, record, replay).
 
 > Inspired by [Jaren8r/Fragment](https://github.com/Jaren8r/Fragment).
 
+This is a single cross-platform project: one shared, OS-independent core, with
+the OS-specific code segregated per platform and one build entry point.
+
+| Path | Role |
+|---|---|
+| [`common/`](common) | The OS-independent core shared by both ports — the x86-64 prologue decoder and the curl-ABI option ids. |
+| [`windows/`](windows) | The Windows port — `Fragment.dll` + `fragment.exe`. DLL injection + an inline-hook engine over libcurl's exports. |
+| [`linux/`](linux) | The Linux port — `libfragment.so` + `fragment`. `LD_PRELOAD` symbol interposition (+ rtld-audit, `dlopen`, and an inline-hook engine), with `ptrace` injection. |
+
+Both ports share the same `FRAGMENT_*` configuration, the same leveled
+Release-capable logger, the same idempotent rewrite + option-neutralization
+semantics, and the same "fail closed / honest boundaries" philosophy.
+
 ---
 
 ## Why the API layer
@@ -30,196 +43,164 @@ URL the application hands to libcurl. It:
 - **Rewrites** `CURLOPT_URL` and URLs built through the `curl_url` API
   (`curl_url_set`, and `CURLOPT_CURLU` handles) to the proxy prefix. The rewrite
   is **idempotent**, so re-setting a URL — or the interplay between the
-  `setopt` and `curl_url_set` hooks — never double-prefixes.
+  `setopt` and `curl_url_set` paths — never double-prefixes.
 - **Neutralizes options that would divert traffic back off the proxy**:
-  `CURLOPT_RESOLVE` and `CURLOPT_CONNECT_TO` (a DNS/host pin), `CURLOPT_PORT`
-  (a port override), `CURLOPT_UNIX_SOCKET_PATH` / `CURLOPT_ABSTRACT_UNIX_SOCKET`
-  (a local socket in place of the TCP path to the proxy), and `CURLOPT_PROXY` /
-  `CURLOPT_PRE_PROXY` (an upstream proxy that would carry the rewritten request
-  off-box). The proxy options are forced to `""` (a *direct* connection that
-  also overrides the environment proxy variables), and Fragment scrubs
-  `http_proxy` / `https_proxy` / `all_proxy` (and friends) from the target's
-  environment at load time so an app that never sets a proxy through the API
-  can't inherit one either.
+  `CURLOPT_RESOLVE` and `CURLOPT_CONNECT_TO`, `CURLOPT_PORT`,
+  `CURLOPT_UNIX_SOCKET_PATH` / `CURLOPT_ABSTRACT_UNIX_SOCKET`, and
+  `CURLOPT_PROXY` / `CURLOPT_PRE_PROXY` (forced to a direct `""`). It also scrubs
+  `http_proxy` / `https_proxy` / `all_proxy` from the target's environment at
+  load so an app that never sets a proxy through the API can't inherit one.
 
 The "rewrite at the curl API before the connection" property is the whole point;
-everything else — the hooking engine, the way the module is intercepted, the
-configuration — is just implementation.
+everything else — interposition, the inline-hook engine, the way the module is
+delivered into the process — is just implementation.
 
 ---
 
 ## Quick start
 
 ```sh
-# Build (auto-detects any VS 2017+ with the C++ x64 toolset; no hardcoded paths)
-build.bat Release
+# Windows  (Visual Studio 2017+ with the C++ x64 toolset)
+cd windows && build.bat
+build\fragment.exe -- curl.exe https://api.example.com/health   # launch & inject
+build\fragment.exe --pid 1234                                   # inject into a PID
 
-# Launch a program with its libcurl redirected to http://127.0.0.1:9020
-build\fragment.exe -- curl.exe https://api.example.com/health
-
-# ...or inject into an already-running process
-build\fragment.exe --pid 1234
+# Linux  (any C compiler; cmake optional)
+cd linux && ./build.sh
+./build/fragment -- curl https://api.example.com/health         # launch & preload
+./build/fragment --pid 1234                                     # ptrace-inject into a PID
 ```
+
+Or build the host platform from the repository root with the single CMake entry:
+`cmake -S . -B build && cmake --build build`.
 
 You provide the proxy listening on `127.0.0.1:9020`. It receives requests whose
 path is the full original URL (e.g. `GET /https://api.example.com/health`) and
-is expected to forward them upstream and relay the response.
-
-`fragment.exe --help` lists every option; all of them simply set the environment
-variables below for the launched target.
+is expected to forward them upstream and relay the response. `fragment --help`
+lists every option.
 
 ---
 
 ## Configuration
 
 All knobs are read **once at load time from the environment**, so the *same*
-shipped DLL can be re-pointed, toggled, or made verbose with no recompile.
+shipped binary can be re-pointed, toggled, or made verbose with no recompile.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `FRAGMENT_PROXY` | Full proxy base, e.g. `http://127.0.0.1:9020` or `https://10.0.0.5:8888`. Wins if set. | — |
+| `FRAGMENT_PROXY` | Full proxy base, e.g. `http://127.0.0.1:9020`. Wins if set. | — |
 | `FRAGMENT_PROXY_HOST` | Proxy host (when `FRAGMENT_PROXY` is unset). | `127.0.0.1` |
 | `FRAGMENT_PROXY_PORT` | Proxy port (when `FRAGMENT_PROXY` is unset). | `9020` |
-| `FRAGMENT_ENABLED` | `0`/`false`/`no`/`off` → load but do not hook. | `1` |
-| `FRAGMENT_DISABLE` | `1`/`true`/`yes`/`on` → load but do not hook (overrides `FRAGMENT_ENABLED`). | `0` |
+| `FRAGMENT_ENABLED` | `0`/`false`/`no`/`off` → load but do not rewrite. | `1` |
+| `FRAGMENT_DISABLE` | `1`/`true`/`yes`/`on` → load but do not rewrite (overrides `FRAGMENT_ENABLED`). | `0` |
 | `FRAGMENT_LOG_LEVEL` | `off`\|`error`\|`warn`\|`info`\|`debug`. | `off` (Release) |
-| `FRAGMENT_LOG_FILE` | Write diagnostics to a file; if unset, logs go to the debugger (`OutputDebugString`). | — |
-| `FRAGMENT_LOG_CONSOLE` | `1` → allocate a console and tee logs there. | `0` |
-| `FRAGMENT_LOADER` | Module-load interception strategy: `auto`\|`notify`\|`ldrloaddll`\|`loadlibrary`. | `auto` |
+| `FRAGMENT_LOG_FILE` | Write diagnostics to a file; if unset, to the debugger (Windows) / stderr (Linux). | — |
+| `FRAGMENT_LOG_CONSOLE` | `1` → also surface logs on a console / stderr. | `0` |
+| `FRAGMENT_LOADER` | Interception strategy — Windows: `auto`\|`notify`\|`ldrloaddll`\|`loadlibrary`; Linux: `auto`\|`interpose`\|`audit`\|`hook`. | `auto` |
 
 A malformed `FRAGMENT_PROXY` (empty, scheme-less, or collapsing to `/`) is
 rejected with a warning and the default is used, so a typo can never silently
-disable rewriting.
-
-Diagnostics work in **Release**, not just debug builds: set `FRAGMENT_LOG_LEVEL`
-(and optionally `FRAGMENT_LOG_FILE`) and the leveled, thread-safe logger is
-active. When the level is `off` the hot path costs a single comparison.
+disable rewriting. Diagnostics work in **Release**: when the level is `off` the
+hot path costs a single comparison.
 
 ---
 
 ## How interception works
 
-**Finding libcurl.** For shared libcurl, Fragment resolves the hooked functions
-by **export** (`GetProcAddress`) — version-, compiler-, and bitness-invariant,
-because the export names are part of libcurl's stable ABI. It works for every
-shared libcurl, forever, with no signatures. For *statically*-linked curl (no
-export table) it falls back to a small per-compiler-family prologue-signature
-scan, gated on the module actually containing the symbol name so it never
-false-matches.
+Both ports rewrite at the same curl-API boundary and ship their **own**
+inline-hook engine — no third-party dependency. The engine length-decodes the
+target prologue, relocates it into a trampoline within reach, and patches a
+jump; the decoder **fails closed** (anything it cannot relocate with certainty
+is refused, leaving the target untouched). The x86-64 prologue decoder is the
+OS-independent part and lives once in [`common/decode_x86_64.h`](common/decode_x86_64.h),
+shared by both ports.
 
-**Catching the module however it loads.** A curl module can enter a process many
-ways — already mapped, `LoadLibrary`, `LoadLibraryEx`, delay-load, or pulled in
-transitively as another DLL's dependency. Fragment layers independent
-approaches and degrades gracefully (`FRAGMENT_LOADER` forces one):
+### Windows
 
-1. **`LdrRegisterDllNotification`** — the loader's own load-notification
-   callback. Fires for *every* mapped image regardless of load path, including
-   transitive static-import dependencies. The default and broadest.
-2. **`LdrLoadDll` hook** — the single ntdll chokepoint that `LoadLibrary`
-   A/W/Ex and the delay-load helper all funnel through. Used if the
-   notification API is unavailable.
-3. **`LoadLibraryA`/`W` detours** — a last-resort fallback.
+**Finding libcurl** by **export** (`GetProcAddress`) for any shared libcurl
+(version-, compiler-, bitness-invariant), with a per-compiler-family
+prologue-signature scan as a fallback for statically-linked curl, gated on the
+module containing the symbol name. **Catching the module however it loads** by
+layering `LdrRegisterDllNotification` (every mapped image, incl. transitive
+static imports), an `LdrLoadDll` chokepoint hook (LoadLibrary A/W/Ex +
+delay-load), and `LoadLibraryA`/`W` detours, plus an already-mapped sweep, with
+a dedup keyed on the resolved address. The engine relocates into a trampoline
+within ±2 GB and patches a 5-byte jump. **Delivery** is `CreateRemoteThread` +
+`LoadLibrary` (`fragment.exe`); 32-bit (WOW64) targets are refused.
 
-Plus an initial sweep of already-mapped modules at attach. Overlap between
-approaches is collapsed by a dedup keyed on the resolved target address (sourced
-from the hook registry, so it is unbounded — no fixed cap).
+### Linux
 
-**Hooking.** Fragment ships its **own** x86-64 inline-hook engine — no
-third-party dependency. It length-decodes the target prologue, relocates it into
-a trampoline within ±2 GB, and patches a 5-byte jump. The decoder **fails
-closed**: anything it cannot decode with certainty (an unknown opcode, a short
-branch leaving the copied window, an out-of-range relocation) is refused and the
-target is left untouched, so a mis-decode can never corrupt the process.
+**Symbol interposition** is the portable primary: the preloaded `.so` exports
+`curl_easy_setopt` / `curl_url_set` and forwards through `dlsym(RTLD_NEXT)`,
+shadowing libcurl for a direct link, a transitive dependency, or a default-scope
+`dlopen`, on **x86-64 and aarch64**, with no machine code. `FRAGMENT_LOADER`
+selects/forces among `auto` (interposition + an inline byte-patch of the real
+libcurl, which also covers an injected process), `interpose`, `audit` (the
+loader's rtld-audit `la_symbind` rebind), and `hook`. The functions to patch are
+resolved by reading the owning object's `.dynsym` / `.symtab` (immune to
+interposition, correct even when injected), with a prologue-signature scan as a
+stripped-binary fallback. The aarch64 backend patches a single naturally-aligned
+4-byte word (atomic, BTI-correct). **Delivery** is `LD_PRELOAD` / `LD_AUDIT`
+launch, or `ptrace` injection that makes the target `dlopen` the library
+(`dlopen` located by `dladdr` and matched in the target by inode).
 
 ---
 
 ## Building
 
-Requires Visual Studio 2017+ with the C++ x64 toolset (any edition, including
-Build Tools). `build.bat` locates it via `vswhere` — no machine-specific paths —
-and prefers a CMake/Ninja on `PATH`, otherwise the copies bundled with VS.
-
 ```sh
-build.bat            # Release
-build.bat Debug      # Debug (chatty logging by default)
+# Windows: auto-detects any VS 2017+ x64 toolset via vswhere -- no hardcoded paths.
+cd windows && build.bat            # Release   (build.bat Debug for chatty logging)
+
+# Linux: prefers CMake (Ninja if present), falls back to a direct cc build.
+cd linux && ./build.sh             # Release   (./build.sh Debug; or `make`)
+
+# Either platform, from the repo root:
+cmake -S . -B build && cmake --build build
 ```
 
-CMake presets are provided (`cmake --preset release|debug|msvc`). Continuous
-integration (`.github/workflows/ci.yml`) builds on a clean `windows-latest`
-runner and runs the self-contained engine and mock-libcurl tests on every push;
-tagging `v*` builds, smoke-tests, and publishes a release artifact
-(`Fragment.dll` + `fragment.exe`).
+Continuous integration ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
+builds on clean `windows-latest` and `ubuntu-latest` runners and runs the
+self-contained engine unit test and the mock-libcurl integration on every push.
 
 ---
 
 ## Testing
 
 ```sh
-python test\run.py            # full matrix (Release)
-python test\run.py --debug    # Debug build
+python3 windows/test/run.py        # Windows matrix (needs the third-party corpus)
+python3 linux/test/run.py          # Linux matrix   (uses the system libcurl + curl)
 ```
 
-The suite proves behavior, not assertions:
-
-- A **hook-engine unit test** exercises prologue relocation (RIP-relative loads,
-  rel32 branches) and the fail-closed refusals.
-- A **mock-libcurl integration test** (no servers, no real libcurl) proves the
-  export-resolution → `setopt` rewrite → idempotency → option-drop path; it runs
-  in CI on a clean machine.
-- A **real-libcurl matrix** spanning libcurl 7.30 → 8.20 and five compilers
-  (VS2010, VS2012, modern MSVC, MinGW-GCC, LLVM/clang), covering shared-library
-  (export) and static (signature) resolution, the `curl_url` API, every
-  interception approach in isolation, runtime reconfiguration, a concurrency
-  stress test, and a per-call overhead/injection-latency benchmark.
-- **Non-vacuous negative controls** prove the divert options (`RESOLVE`,
-  `CONNECT_TO`, `PORT`, `PROXY`, the `http_proxy` env var) really *do* divert
-  when not neutralized, and that the narrower interception modes really miss
-  what the broadest one catches.
-
-The real-libcurl binaries are third-party and intentionally not committed; see
-[`test/curl/README.md`](test/curl/README.md) to reproduce the corpus.
-
-Typical measured per-call overhead of the `setopt` detour is on the order of a
-few tens of nanoseconds — negligible against a real request, which the
-benchmark reports honestly (it does not pretend the request-level throughput
-difference is a hook cost).
+Each suite proves behavior, not assertions: a **hook-engine unit test**
+(prologue relocation + fail-closed refusals), a self-contained **mock-libcurl
+integration test** (no third-party binaries, CI-runnable), and a **real-libcurl
+matrix**. Windows spans libcurl 7.30 → 8.20 and five compilers across the export
+and static-signature paths. Linux drives the system libcurl and `curl` binary
+through interposition, the `curl_url` API, a transitive dependency, dlopen-then-
+`dlsym`, all four modes, runtime config, bypass neutralization with non-vacuous
+negative controls, a concurrency stress, a benchmark, the launcher, and a live
+`ptrace --pid` injection — plus the x86-64 subset under `qemu-x86_64`.
 
 ---
 
 ## Limitations (honest boundaries)
 
-Fragment is precise about what it does *not* cover:
-
-- **x64 only.** The hook engine, caller stubs, and static-curl signatures are
-  x86-64; `fragment.exe` detects and refuses 32-bit (WOW64) targets.
-- **API-layer interception is bypassable below it.** Anything that reaches the
-  network beneath the URL API is invisible: a custom
+- **x86-64 (both) / aarch64 (Linux) only** for the inline-hook layers. The
+  Linux symbol interposition itself is architecture-independent; the byte-patch
+  engine, caller stubs, and static-curl signatures are not.
+- **API-layer interception is bypassable below it** — a custom
   `CURLOPT_OPENSOCKETFUNCTION` / `CURLOPT_SOCKOPTFUNCTION`, or an app that opens
-  its own raw sockets. (A Unix-domain socket requested the normal way, via
-  `CURLOPT_UNIX_SOCKET_PATH`, *is* neutralized — it flows through the hooked
-  `setopt` — but a socket created entirely outside libcurl is not.)
-- **Static-curl support is signature-based and therefore best-effort.** Shared
-  libcurl (export-resolved) is universal; statically-linked curl relies on
-  prologue signatures for known compiler families and **fails closed** (no hook,
-  traffic un-proxied) on an unrecognized prologue — silent unless logging is on.
-  A statically-linked curl living inside a *dynamically*-loaded DLL whose name
-  lacks "curl" is also skipped by the (name-gated) signature scan.
-- **`FRAGMENT_LOADER=ldrloaddll` misses statically-imported curl.** A libcurl
-  pulled in as a static import of another DLL is mapped by the loader's internal
-  dependency walker, which the exported `LdrLoadDll` does not see. The default
-  `auto`/notification mode *does* catch it (and the test suite locks this in as
-  a negative control). Prefer the default unless you have a reason not to.
-- **Proxy neutralization covers the cases Fragment can see.** It forces
-  `CURLOPT_PROXY`/`PRE_PROXY` direct and scrubs the standard proxy environment
-  variables at load. A proxy set on a handle *before* Fragment's hook is
-  installed (a racy pre-injection configuration) would not be re-overridden.
-- **Narrow torn-write window on the load-notification path.** Curl hooks
-  installed from the loader-notification callback use an atomic 8-byte publish
-  where alignment allows; for the rare wide/unaligned prologue a thread calling
-  curl at the exact instant the module appears could read a torn instruction.
-  In the normal flow, hooks land before curl is exercised.
-- **Injection needs the right privileges**, and **manually-mapped** modules
-  (loaded without the OS loader, so no load event fires) are not seen.
+  its own raw sockets, is invisible.
+- **Static-curl support is symbol-table-based, then best-effort.** A stripped
+  static curl falls to a prologue-signature scan that **fails closed** when the
+  symbol name is absent from loaded memory.
+- **Linux `audit` mode rebinds call sites, not captured addresses**, and needs
+  `LD_AUDIT` at startup (launch-only). The other modes do not share this.
+- **Injection needs the right privileges** (an injectable target, and on Linux
+  `CAP_SYS_PTRACE` / root / `ptrace_scope=0`); a manually-mapped or fully-static
+  target may not be reachable. Config for an injected target comes from *its*
+  environment.
 
 If total interception matters for your use case, treat these as the edges of the
 guarantee, not footnotes.
@@ -229,15 +210,14 @@ guarantee, not footnotes.
 ## Layout
 
 ```
-main.c        injection entry, the curl detours, loader-interception strategy
-hook.h        the standalone x86-64 inline-hook engine (decoder, trampolines)
-util.h        export/signature resolution, caller stubs, PE/region helpers
-config.h      environment-driven configuration
-log.h         leveled, thread-safe, Release-capable logger
-curl.h        the slice of libcurl's stable ABI Fragment depends on
-tools/        fragment.exe — the end-user loader/injector
-test/         the engine, mock, and real-libcurl test suite
+common/      shared, OS-independent core (x86-64 prologue decoder, curl-ABI ids)
+windows/     Windows port: DllMain hooks, PE resolution, the Win32 engine, loader, tests
+linux/       Linux port: interposers + rtld-audit + ELF resolution, the POSIX engine, loader, tests
+CMakeLists.txt   one entry point -> builds the host platform from common/ + windows|linux
 ```
+
+Each port's directory carries its own platform build script and a `test/`
+suite; both pull the shared core in through a relative include.
 
 ---
 

@@ -1,14 +1,20 @@
 name: Release
 
+# One unified version per tag: pushing `vX.Y.Z` builds BOTH platforms and
+# publishes a single GitHub release for that tag carrying both archives, with
+# the body taken from that version's CHANGELOG section. (Versioning is unified
+# across the project -- the same tag releases the Windows and Linux ports at the
+# same version; there are no per-platform tags.)
 on:
   push:
     tags: [ 'v*' ]
 
+permissions:
+  contents: write
+
 jobs:
-  release:
+  windows:
     runs-on: windows-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -18,30 +24,102 @@ jobs:
           arch: x64
 
       - name: Build (Release)
+        shell: pwsh
         run: |
-          cmake -S . -B build -A x64
-          cmake --build build --config Release
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          cmake -S windows -B windows/build -A x64 -DFRAGMENT_VERSION="$ver"
+          cmake --build windows/build --config Release
 
       - name: Smoke-test the release binary (mock-libcurl integration)
         shell: cmd
         run: |
-          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /LD test\mockcurl.c /Fe:build\mockcurl.dll /Fo:build\mockcurl.obj || exit /b 1
-          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS test\host_mock.c    /Fe:build\host_mock.exe /Fo:build\host_mock.obj || exit /b 1
-          build\host_mock.exe build\Release\Fragment.dll build\mockcurl.dll || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /LD windows\test\mockcurl.c /Fe:windows\build\mockcurl.dll /Fo:windows\build\mockcurl.obj || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS windows\test\host_mock.c    /Fe:windows\build\host_mock.exe /Fo:windows\build\host_mock.obj || exit /b 1
+          windows\build\host_mock.exe windows\build\Release\Fragment.dll windows\build\mockcurl.dll || exit /b 1
 
       - name: Stage package
         shell: pwsh
         run: |
-          $stage = "fragment-${{ github.ref_name }}-x64"
+          $stage = "fragment-${{ github.ref_name }}-windows-x64"
           New-Item -ItemType Directory -Path $stage | Out-Null
-          Copy-Item build/Release/Fragment.dll $stage/
-          Copy-Item build/Release/fragment.exe  $stage/
-          if (Test-Path README.md) { Copy-Item README.md $stage/ }
-          if (Test-Path LICENSE)   { Copy-Item LICENSE   $stage/ }
+          Copy-Item windows/build/Release/Fragment.dll $stage/
+          Copy-Item windows/build/Release/fragment.exe  $stage/
+          Copy-Item README.md  $stage/
+          Copy-Item LICENSE    $stage/
           Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-windows
+          path: fragment-${{ github.ref_name }}-windows-x64.zip
+          if-no-files-found: error
+
+  linux:
+    # Release a native build for each Linux architecture the port supports.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ ubuntu-latest, ubuntu-24.04-arm ]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake
+
+      - name: Build (Release)
+        working-directory: linux
+        run: FRAGMENT_VERSION="${GITHUB_REF_NAME#v}" ./build.sh Release
+
+      - name: Smoke-test the release library (mock-libcurl integration)
+        working-directory: linux
+        run: |
+          cc -O2 -std=c17 -fPIC -shared test/mockcurl.c -o build/libmockcurl.so
+          cc -O2 -std=c17 test/host_mock.c -o build/host_mock -Lbuild -lmockcurl -Wl,-rpath,"$PWD/build"
+          env -u FRAGMENT_PROXY LD_PRELOAD="$PWD/build/libfragment.so" ./build/host_mock
+
+      - name: Stage package
+        run: |
+          stage="fragment-${{ github.ref_name }}-linux-${{ runner.arch }}"
+          mkdir -p "$stage"
+          cp linux/build/libfragment.so linux/build/fragment "$stage"/
+          cp README.md LICENSE "$stage"/
+          tar czf "$stage.tar.gz" -C "$stage" .
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-linux-${{ runner.arch }}
+          path: fragment-${{ github.ref_name }}-linux-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [ windows, linux ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download platform packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Extract this version's changelog section
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '
+            $0 ~ "^## \\[" v "\\]" { f = 1; next }
+            /^## \[/ { f = 0 }
+            f { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "Release ${GITHUB_REF_NAME}." > notes.md; fi
+          echo "----- release notes -----"; cat notes.md
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: fragment-${{ github.ref_name }}-x64.zip
-          generate_release_notes: true
+          files: dist/*
+          body_path: notes.md
+          fail_on_unmatched_files: true

@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../common/version.h"
 
 static void usage(void) {
     fprintf(stderr,
@@ -28,7 +29,8 @@ static void usage(void) {
         "  --log-file <p>    write diagnostics to a file            (FRAGMENT_LOG_FILE)\n"
         "  --loader <how>    auto|notify|ldrloaddll|loadlibrary     (FRAGMENT_LOADER)\n"
         "  --off             inject but leave rewriting disabled    (FRAGMENT_ENABLED=0)\n"
-        "  -h, --help        show this help\n\n"
+        "  -h, --help        show this help\n"
+        "  -V, --version     print the Fragment version\n\n"
         "Note: --proxy/--host/--port/--log* configure LAUNCHED targets (they are passed\n"
         "via the inherited environment). For --pid, set those environment variables\n"
         "before the target starts, or system-wide.\n");
@@ -97,6 +99,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--loader") && i + 1 < argc) loader = argv[++i];
         else if (!strcmp(argv[i], "--off")) off = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(); return 0; }
+        else if (!strcmp(argv[i], "-V") || !strcmp(argv[i], "--version")) { printf("fragment %s\n", FRAGMENT_VERSION); return 0; }
         else { fprintf(stderr, "[fragment] unknown option: %s\n", argv[i]); usage(); return 2; }
     }
     if (pid == 0 && launchIdx < 0) { usage(); return 2; }

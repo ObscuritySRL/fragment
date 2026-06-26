@@ -1,6 +1,9 @@
-# Normalize line endings: text files stored as LF in the repo.
+# Normalize line endings: text files are stored as LF in the repo.
 * text=auto eol=lf
 
-# Windows batch scripts need CRLF.
+# Windows batch scripts need CRLF in the working tree.
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Shell scripts are always LF.
+*.sh text eol=lf

@@ -1,40 +1,46 @@
-# CLion
-.idea
-
-# CMake
-CMakeLists.txt.user
-CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-Makefile
-cmake_install.cmake
-install_manifest.txt
-compile_commands.json
-CTestTestfile.cmake
-_deps
-# Project exclude paths
-/cmake-build-debug/
-/cmake-build-release/
-
-# Build output (build.bat / build_test.bat)
-/build/
-/build_log.txt
+# Build output (out-of-source; every package builds into build/)
+build/
+build_ci/
+build_log.txt
+*.o
 *.obj
+*.so
+*.so.*
+*.dll
+*.exe
+
+# CMake leftovers that can land in a source tree
+CMakeCache.txt
+CMakeFiles/
+CMakeLists.txt.user
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+install_manifest.txt
+_deps/
+cmake-build-debug/
+cmake-build-release/
+
+# IDEs
+.idea/
 
 # Python bytecode cache
 __pycache__/
 *.pyc
 
-# Third-party libcurl test corpus: the BINARIES are fetched/copied locally and
-# not committed (see test/curl/README.md to reproduce), but the README that
-# documents how to obtain them IS tracked.
-/test/curl/*.dll
-/test/curl/*.exe
+# Third-party libcurl test corpus: the binaries are fetched/built locally and
+# not committed; the README that documents how to obtain them IS tracked.
+**/test/curl/*
+!**/test/curl/README.md
 
-# Local build dirs used to mirror the CI (VS multi-config) layout.
-/build_ci/
-
-# Stray debug log from an injected target (configurable via FRAGMENT_LOG_FILE).
-/Fragment.log
+# Stray log from an injected target (configurable via FRAGMENT_LOG_FILE).
+Fragment.log
+fragment.log
 *.Fragment.log
+*.fragment.log
+
+# Editor / assistant scratch.
+CLAUDE-FABLE-5.md
+
+# Local prompt / goal scaffolding (not part of the published repo).
+prompts/
