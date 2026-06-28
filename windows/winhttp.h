@@ -47,11 +47,13 @@ typedef HINTERNET (WINAPI *WhOpenFn)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
 typedef HINTERNET (WINAPI *WhConnectFn)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
 typedef HINTERNET (WINAPI *WhOpenRequestFn)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
 typedef BOOL      (WINAPI *WhCloseHandleFn)(HINTERNET);
+typedef BOOL      (WINAPI *WhSetOptionFn)(HINTERNET, DWORD, LPVOID, DWORD);
 
 static WhOpenFn        gWhOpen        = NULL;
 static WhConnectFn     gWhConnect     = NULL;
 static WhOpenRequestFn gWhOpenRequest = NULL;
 static WhCloseHandleFn gWhClose       = NULL;
+static WhSetOptionFn   gWhSetOption   = NULL;
 
 /* ---- hConnect -> original (host, port) map ---------------------------- */
 typedef struct WhConn {
@@ -199,6 +201,19 @@ static BOOL WINAPI WhCloseDetour(HINTERNET h) {
     return gWhClose(h);
 }
 
+/* Swallow a proxy set AFTER the session is open: an app that calls
+ * WinHttpSetOption(WINHTTP_OPTION_PROXY) would otherwise re-introduce an
+ * upstream proxy between the target and our local proxy, undoing the NO_PROXY we
+ * forced at WinHttpOpen. Report success so the app proceeds; the session stays
+ * direct (mirrors the curl backend dropping CURLOPT_PROXY). */
+static BOOL WINAPI WhSetOptionDetour(HINTERNET h, DWORD option, LPVOID buf, DWORD len) {
+    if (option == WINHTTP_OPTION_PROXY) {
+        LogDebug("[winhttp] swallow WinHttpSetOption(WINHTTP_OPTION_PROXY)\n");
+        return TRUE;
+    }
+    return gWhSetOption(h, option, buf, len);
+}
+
 /* ---- install ---------------------------------------------------------- */
 
 static void WhInstall(HMODULE m, const char* name, LPVOID detour, LPVOID* orig) {
@@ -214,6 +229,15 @@ static void WhInstall(HMODULE m, const char* name, LPVOID detour, LPVOID* orig) 
 /* Install the WinHTTP backend when winhttp.dll appears. Reuses the curl
  * backend's gHookLock (defined in main.c, above this header's include point) so
  * resolve+dedup+install is serialized against the curl path's shared registry. */
+/* winhttp.dll by name, OR any module exporting the WinHTTP request entry points
+ * -- this catches a copy loaded from a non-System32 path or an SxS-redirected
+ * name. Nothing but WinHTTP exports these symbols, so the export probe will not
+ * false-match (and once a backend slot is bound, WhInstall skips re-binding). */
+static BOOL WhIsWinHttp(HMODULE m, const char* nm) {
+    if (!_stricmp(nm, "winhttp.dll")) return TRUE;
+    return GetProcAddress(m, "WinHttpConnect") && GetProcAddress(m, "WinHttpOpenRequest");
+}
+
 void HookWinHttp(HMODULE module) {
     if (!module) return;
 
@@ -222,7 +246,7 @@ void HookWinHttp(HMODULE module) {
     const char* nm = path;
     for (const char* p = path; *p; ++p)
         if (*p == '\\' || *p == '/') nm = p + 1;
-    if (_stricmp(nm, "winhttp.dll") != 0) return;
+    if (!WhIsWinHttp(module, nm)) return;
 
     WhEnsureInit();
 
@@ -231,5 +255,6 @@ void HookWinHttp(HMODULE module) {
     WhInstall(module, "WinHttpConnect",     (LPVOID) &WhConnectDetour,     (LPVOID*) &gWhConnect);
     WhInstall(module, "WinHttpOpenRequest", (LPVOID) &WhOpenRequestDetour, (LPVOID*) &gWhOpenRequest);
     WhInstall(module, "WinHttpCloseHandle", (LPVOID) &WhCloseDetour,       (LPVOID*) &gWhClose);
+    WhInstall(module, "WinHttpSetOption",   (LPVOID) &WhSetOptionDetour,   (LPVOID*) &gWhSetOption);
     if (gHookLockReady) LeaveCriticalSection(&gHookLock);
 }
