@@ -1,0 +1,235 @@
+#pragma once
+
+#include <windows.h>
+#include <winhttp.h>
+#include <stdlib.h>
+#include <wchar.h>
+#include "log.h"
+#include "config.h"
+#include "util.h"   // CreateAndEnableHook
+#include "hook.h"   // FrIsHooked
+
+/*
+ * WinHTTP backend -- the same "redirect the intent to the local proxy BEFORE
+ * TLS" idea as the libcurl backend, applied to winhttp.dll.
+ *
+ * Why it is not a copy of the curl backend: libcurl funnels the whole
+ * destination through ONE variadic setter (curl_easy_setopt(CURLOPT_URL)), so a
+ * single detour rewrites the URL string. WinHTTP has no such call -- a request
+ * is assembled across handles:
+ *
+ *     WinHttpConnect(hSession, host, port, ...)        -> hConnect   (host+port)
+ *     WinHttpOpenRequest(hConnect, verb, path, ..., flags) -> hRequest (path+scheme)
+ *     WinHttpSendRequest(hRequest, ...)                              (sends)
+ *
+ * The host lives on the connection handle and the path/scheme live on the
+ * request handle, so we hook BOTH and correlate by HINTERNET: WinHttpConnect
+ * remembers the original (host, port) keyed by the handle it returns, and
+ * WinHttpOpenRequest looks that up to rebuild the full original URL into the
+ * request's object name, exactly as the curl prefix does:
+ *
+ *     GET /https://api.example.com/health   ->   proxy at 127.0.0.1:9020
+ *
+ * Like curl, the rewrite happens before any connection or handshake, so cert
+ * pinning is never engaged: the origin TLS session simply never starts.
+ *
+ * Resolution is by export only -- winhttp.dll is a stable system module, so the
+ * static-signature scan the curl backend needs has no analogue here. There is
+ * one winhttp.dll per process, so (unlike curl's per-module caller stubs) plain
+ * global trampolines suffice.
+ *
+ * Scope: a redirect-to-LOCAL-proxy inspection backend, for software/systems the
+ * operator is authorized to analyze (see README). No remote egress.
+ */
+
+/* ---- WinHTTP entry points we hook (signatures per the SDK) ------------- */
+typedef HINTERNET (WINAPI *WhOpenFn)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+typedef HINTERNET (WINAPI *WhConnectFn)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+typedef HINTERNET (WINAPI *WhOpenRequestFn)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
+typedef BOOL      (WINAPI *WhCloseHandleFn)(HINTERNET);
+
+static WhOpenFn        gWhOpen        = NULL;
+static WhConnectFn     gWhConnect     = NULL;
+static WhOpenRequestFn gWhOpenRequest = NULL;
+static WhCloseHandleFn gWhClose       = NULL;
+
+/* ---- hConnect -> original (host, port) map ---------------------------- */
+typedef struct WhConn {
+    HINTERNET      handle;
+    wchar_t*       host;     /* original server name (owned)          */
+    INTERNET_PORT  port;     /* original port (0 == INTERNET_DEFAULT) */
+    struct WhConn* next;
+} WhConn;
+
+static WhConn*          gWhConns = NULL;
+static CRITICAL_SECTION gWhLock;
+
+/* One-time init of gWhLock. Runs inside HookWinHttp BEFORE any winhttp export is
+ * hooked, so it always precedes the first detour that touches the map. */
+static void WhEnsureInit(void) {
+    static volatile LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0)
+        InitializeCriticalSection(&gWhLock);
+}
+
+static void WhRemember(HINTERNET h, LPCWSTR host, INTERNET_PORT port) {
+    if (!h) return;
+    WhConn* e = (WhConn*) malloc(sizeof(WhConn));
+    if (!e) return;
+    e->handle = h;
+    e->port   = port;
+    e->host   = host ? _wcsdup(host) : NULL;
+    EnterCriticalSection(&gWhLock);
+    e->next  = gWhConns;
+    gWhConns = e;
+    LeaveCriticalSection(&gWhLock);
+}
+
+/* Copy the origin for `h` into caller storage (caller frees *outHost).
+ * Returns FALSE if the handle was never seen (e.g. a connection opened before
+ * the hook installed) -- the caller then leaves the request untouched. */
+static BOOL WhLookup(HINTERNET h, wchar_t** outHost, INTERNET_PORT* outPort) {
+    BOOL found = FALSE;
+    EnterCriticalSection(&gWhLock);
+    for (WhConn* e = gWhConns; e; e = e->next) {
+        if (e->handle == h) {
+            *outHost = e->host ? _wcsdup(e->host) : NULL;
+            *outPort = e->port;
+            found = TRUE;
+            break;
+        }
+    }
+    LeaveCriticalSection(&gWhLock);
+    return found;
+}
+
+static void WhForget(HINTERNET h) {
+    EnterCriticalSection(&gWhLock);
+    for (WhConn** pp = &gWhConns; *pp; pp = &(*pp)->next) {
+        if ((*pp)->handle == h) {
+            WhConn* dead = *pp;
+            *pp = dead->next;
+            free(dead->host);
+            free(dead);
+            break;
+        }
+    }
+    LeaveCriticalSection(&gWhLock);
+}
+
+/* ---- detours ---------------------------------------------------------- */
+
+/* Force a DIRECT session: the proxy IS our destination, so an app's upstream
+ * proxy must not be interposed between the target and 127.0.0.1:9020. Mirrors
+ * the curl backend forcing CURLOPT_PROXY="". */
+static HINTERNET WINAPI WhOpenDetour(LPCWSTR agent, DWORD accessType, LPCWSTR proxy,
+                                     LPCWSTR proxyBypass, DWORD flags) {
+    if (accessType != WINHTTP_ACCESS_TYPE_NO_PROXY) {
+        LogDebug("[winhttp] WinHttpOpen: forcing NO_PROXY (was %lu)\n", accessType);
+        accessType  = WINHTTP_ACCESS_TYPE_NO_PROXY;
+        proxy       = WINHTTP_NO_PROXY_NAME;
+        proxyBypass = WINHTTP_NO_PROXY_BYPASS;
+    }
+    return gWhOpen(agent, accessType, proxy, proxyBypass, flags);
+}
+
+/* Redirect the connection to the local proxy and remember the real origin,
+ * keyed by the returned handle, for WinHttpOpenRequest to rebuild. */
+static HINTERNET WINAPI WhConnectDetour(HINTERNET session, LPCWSTR server,
+                                        INTERNET_PORT port, DWORD reserved) {
+    if (!gCfg.proxyHostW[0])                     /* no usable proxy host: pass through */
+        return gWhConnect(session, server, port, reserved);
+
+    HINTERNET h = gWhConnect(session, gCfg.proxyHostW, (INTERNET_PORT) gCfg.proxyPort, reserved);
+    if (h) {
+        WhRemember(h, server, port);
+        LogDebug("[winhttp] WinHttpConnect: %ls:%u -> %ls:%u (h=0x%p)\n",
+                 server ? server : L"(null)", (unsigned) port,
+                 gCfg.proxyHostW, (unsigned) gCfg.proxyPort, h);
+    }
+    return h;
+}
+
+/* Rebuild the object name to /<origin-scheme>://<host>[:port]<path> so the proxy
+ * receives the full original URL, and set the request's secure flag from the
+ * PROXY's scheme (what we speak to 127.0.0.1:9020), not the origin's. */
+static HINTERNET WINAPI WhOpenRequestDetour(HINTERNET connect, LPCWSTR verb,
+                                            LPCWSTR object, LPCWSTR version,
+                                            LPCWSTR referrer, LPCWSTR* acceptTypes,
+                                            DWORD flags) {
+    wchar_t*      host     = NULL;
+    INTERNET_PORT origPort = 0;
+    wchar_t*      newObject = NULL;
+
+    if (WhLookup(connect, &host, &origPort)) {
+        BOOL           originSecure = (flags & WINHTTP_FLAG_SECURE) != 0;
+        const wchar_t* scheme       = originSecure ? L"https" : L"http";
+        INTERNET_PORT  defPort      = originSecure ? 443 : 80;
+        const wchar_t* path         = (object && *object) ? object : L"/";
+        const wchar_t* lead         = (path[0] == L'/') ? L"" : L"/";
+
+        size_t cap = 1 + 5 + 3 + (host ? wcslen(host) : 0) + 6 + 1 + wcslen(path) + 1;
+        newObject = (wchar_t*) malloc(cap * sizeof(wchar_t));
+        if (newObject) {
+            if (origPort != 0 && origPort != defPort)
+                _snwprintf_s(newObject, cap, _TRUNCATE, L"/%ls://%ls:%u%ls%ls",
+                             scheme, host ? host : L"", (unsigned) origPort, lead, path);
+            else
+                _snwprintf_s(newObject, cap, _TRUNCATE, L"/%ls://%ls%ls%ls",
+                             scheme, host ? host : L"", lead, path);
+            object = newObject;
+            LogDebug("[winhttp] WinHttpOpenRequest -> %ls\n", newObject);
+        }
+
+        if (gCfg.proxySecure) flags |=  WINHTTP_FLAG_SECURE;
+        else                  flags &= ~WINHTTP_FLAG_SECURE;
+    }
+
+    HINTERNET h = gWhOpenRequest(connect, verb, object, version, referrer, acceptTypes, flags);
+
+    free(newObject);
+    free(host);
+    return h;
+}
+
+/* Evict the origin entry before the handle value can be recycled by a later
+ * WinHttpConnect (closing hSession/hRequest finds nothing and is a no-op). */
+static BOOL WINAPI WhCloseDetour(HINTERNET h) {
+    WhForget(h);
+    return gWhClose(h);
+}
+
+/* ---- install ---------------------------------------------------------- */
+
+static void WhInstall(HMODULE m, const char* name, LPVOID detour, LPVOID* orig) {
+    if (*orig) return;                               /* one winhttp.dll: bind once */
+    LPVOID target = (LPVOID) GetProcAddress(m, name);
+    if (!target || FrIsHooked(target)) return;
+    if (CreateAndEnableHook(name, target, detour, orig))
+        LogInfo("[hook] %s @ 0x%p\n", name, target);
+    else
+        LogWarn("[winhttp] failed to hook %s\n", name);
+}
+
+/* Install the WinHTTP backend when winhttp.dll appears. Reuses the curl
+ * backend's gHookLock (defined in main.c, above this header's include point) so
+ * resolve+dedup+install is serialized against the curl path's shared registry. */
+void HookWinHttp(HMODULE module) {
+    if (!module) return;
+
+    char path[MAX_PATH] = {0};
+    GetModuleFileNameA(module, path, MAX_PATH);
+    const char* nm = path;
+    for (const char* p = path; *p; ++p)
+        if (*p == '\\' || *p == '/') nm = p + 1;
+    if (_stricmp(nm, "winhttp.dll") != 0) return;
+
+    WhEnsureInit();
+
+    if (gHookLockReady) EnterCriticalSection(&gHookLock);
+    WhInstall(module, "WinHttpOpen",        (LPVOID) &WhOpenDetour,        (LPVOID*) &gWhOpen);
+    WhInstall(module, "WinHttpConnect",     (LPVOID) &WhConnectDetour,     (LPVOID*) &gWhConnect);
+    WhInstall(module, "WinHttpOpenRequest", (LPVOID) &WhOpenRequestDetour, (LPVOID*) &gWhOpenRequest);
+    WhInstall(module, "WinHttpCloseHandle", (LPVOID) &WhCloseDetour,       (LPVOID*) &gWhClose);
+    if (gHookLockReady) LeaveCriticalSection(&gHookLock);
+}

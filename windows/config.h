@@ -43,6 +43,11 @@ typedef struct {
     char   proxyPrefix[600];   /* always ends in '/', e.g. http://h:p/ */
     size_t proxyPrefixLen;
     int    loaderMode;         /* one of FRAG_LOADER_*                  */
+    /* The same proxy, split for backends that take host/port/scheme as separate
+     * arguments rather than one URL string (WinHTTP's WinHttpConnect, ...). */
+    wchar_t        proxyHostW[256]; /* proxy host, wide                     */
+    unsigned short proxyPort;       /* proxy port                           */
+    BOOL           proxySecure;     /* proxy base scheme == https           */
 } FragmentConfig;
 
 static FragmentConfig gCfg;
@@ -132,4 +137,31 @@ static void ConfigInit(void) {
     }
     _snprintf_s(gCfg.proxyPrefix, sizeof(gCfg.proxyPrefix), _TRUNCATE, "%s/", base);
     gCfg.proxyPrefixLen = strlen(gCfg.proxyPrefix);
+
+    /* -- split the (validated) base into host / port / scheme. `base` is
+     *    "scheme://host[:port]" with no path or trailing slash here. IPv6
+     *    literals in [brackets] are not split (rare for a local proxy; set
+     *    FRAGMENT_PROXY_HOST/PORT explicitly for those). */
+    {
+        const char* sep   = strstr(base, "://");
+        const char* host0 = sep ? sep + 3 : base;
+        const char* colon = strrchr(host0, ':');
+        char host[256];
+        gCfg.proxySecure = (sep && (size_t)(sep - base) == 5 && !_strnicmp(base, "https", 5));
+        if (colon && colon[1]) {
+            size_t hl = (size_t)(colon - host0);
+            if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+            memcpy(host, host0, hl);
+            host[hl] = 0;
+            gCfg.proxyPort = (unsigned short) atoi(colon + 1);
+        } else {
+            _snprintf_s(host, sizeof(host), _TRUNCATE, "%s", host0);
+            gCfg.proxyPort = gCfg.proxySecure ? 443 : 80;
+        }
+        if (!MultiByteToWideChar(CP_ACP, 0, host, -1, gCfg.proxyHostW,
+                                 (int)(sizeof(gCfg.proxyHostW) / sizeof(wchar_t))))
+            gCfg.proxyHostW[0] = 0;
+        LogDebug("[Fragment] proxy split: host=%ls port=%u secure=%d\n",
+                 gCfg.proxyHostW, (unsigned) gCfg.proxyPort, (int) gCfg.proxySecure);
+    }
 }
