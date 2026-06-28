@@ -19,6 +19,9 @@ cl /nologo /O2 /MD /W3 "%~dp0hooktest.c"    /Fe"%OUT%\hooktest.exe"    /Fo"%OUT%
 cl /nologo /O2 /MD /W3 "%~dp0host_stress.c" /Fe"%OUT%\host_stress.exe" /Fo"%OUT%\host_stress.obj" || exit /b 1
 cl /nologo /O2 /MD /W3 "%~dp0host_bench.c"  /Fe"%OUT%\host_bench.exe"  /Fo"%OUT%\host_bench.obj"  || exit /b 1
 
+REM WinHTTP backend exerciser (dynamically resolves winhttp -- no winhttp.lib).
+cl /nologo /O2 /MD /W3 "%~dp0host_winhttp.c" /Fe"%OUT%\host_winhttp.exe" /Fo"%OUT%\host_winhttp.obj" || exit /b 1
+
 REM Self-contained integration test: a mock libcurl DLL + a host that asserts
 REM the setopt rewrite/idempotency/option-drop behaviour with no real libcurl,
 REM so it runs anywhere (incl. CI) without the third-party corpus.
