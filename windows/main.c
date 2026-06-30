@@ -283,6 +283,11 @@ static void HookLockInit(void) {
     }
 }
 
+// The WinHTTP backend reuses gHookLock / gHookLockReady (defined just above) to
+// serialize its resolve+dedup+install against the curl backend's shared hook
+// registry, so it is included here rather than at the top of the file.
+#include "winhttp.h"
+
 void HookCurl(HMODULE module) {
     if (!module) return;
 
@@ -351,6 +356,14 @@ void HookCurl(HMODULE module) {
     if (gHookLockReady) LeaveCriticalSection(&gHookLock);
 }
 
+// Run every per-module backend over a freshly observed module. New backends
+// (WinHTTP today; WinINet / Schannel / ... next) hang off this single fan-out,
+// which every module-load path below and the already-mapped sweep invoke.
+static void HookModule(HMODULE module) {
+    HookCurl(module);
+    HookWinHttp(module);
+}
+
 typedef HMODULE(*LoadLibraryAFn)(LPCSTR lpLibFileName);
 LoadLibraryAFn LoadLibraryAOriginal = 0;
 
@@ -363,7 +376,7 @@ HMODULE LoadLibraryADetour(LPCSTR lpLibFileName) {
         LogDebug("[LoadLibraryA] loaded %s\n", nm);
     }
 
-    HookCurl(result);
+    HookModule(result);
 
     return result;
 }
@@ -380,7 +393,7 @@ HMODULE LoadLibraryWDetour(LPCWSTR lpLibFileName) {
         LogDebug("[LoadLibraryW] loaded %s\n", nm);
     }
 
-    HookCurl(result);
+    HookModule(result);
 
     return result;
 }
@@ -411,7 +424,7 @@ static VOID CALLBACK DllLoadNotification(ULONG reason,
                                          PVOID context) {
     (void) context;
     if (reason == FR_LDR_DLL_NOTIFICATION_REASON_LOADED && data && data->DllBase)
-        HookCurl((HMODULE) data->DllBase);
+        HookModule((HMODULE) data->DllBase);
 }
 
 static BOOL RegisterLoaderNotification(void) {
@@ -443,7 +456,7 @@ static LONG NTAPI LdrLoadDllDetour(PWSTR path, PULONG flags, PVOID name, PVOID* 
     LONG status = LdrLoadDllOriginal(path, flags, name, handle);
     // NTSTATUS >= 0 is success/informational; *handle is the loaded module.
     if (status >= 0 && handle && *handle)
-        HookCurl((HMODULE) *handle);
+        HookModule((HMODULE) *handle);
     return status;
 }
 
@@ -555,7 +568,7 @@ BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID lpvReserved) {
             DWORD count = cbNeeded / sizeof(HMODULE);
             for (DWORD i = 0; i < count; i++) {
                 if (mods[i] == hinstDLL) continue;   // skip ourselves
-                HookCurl(mods[i]);
+                HookModule(mods[i]);
             }
         }
         FrHeapFree(mods);
