@@ -17,6 +17,7 @@
  *   appproxy     set WinHttpOpen NAMED_PROXY = <a> (neutralization at Open)
  *   setoptproxy  set WinHttpSetOption(PROXY) = <a> (neutralization post-Open)
  *   stress       <a> threads x <b> requests, concurrent
+ *   sessiononly  <a> cycles, closing ONLY the session handle each time
  *   bare         do NOT load Fragment (baseline, or external injection)
  *
  * Exit code is the request rc (0 = ok); the runner judges by the servers.
@@ -168,6 +169,33 @@ int main(int argc, char** argv) {
         for (int i = 0; i < T; i++) if (th[i]) { WaitForSingleObject(th[i], INFINITE); CloseHandle(th[i]); }
         printf("stress: %dx%d done, fails=%ld\n", T, PER, (long) fails);
         return fails ? 70 : 0;
+    }
+
+    if (!strcmp(mode, "sessiononly")) {
+        /* Close ONLY the session handle each cycle. WinHTTP frees the derived
+         * connect/request handles internally WITHOUT routing through the hooked
+         * WinHttpCloseHandle, so this drives the cascade eviction of the
+         * hConnect->origin map (audit fix #1). Every request must still land on
+         * the proxy with the rewritten path. */
+        int K = argc > 4 ? atoi(argv[4]) : 5;
+        if (K < 1) K = 1; if (K > 1000) K = 1000;
+        int bad = 0;
+        for (int i = 0; i < K; i++) {
+            HINTERNET hs = r.open(L"frag-winhttp-test", r.access,
+                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+            if (!hs) { bad++; continue; }
+            HINTERNET hc = r.connect(hs, r.hostW, r.port, 0);
+            if (!hc) { r.close(hs); bad++; continue; }
+            DWORD flags = r.secure ? WINHTTP_FLAG_SECURE : 0;
+            HINTERNET hr = r.openreq(hc, r.verbW, r.pathW, NULL,
+                                     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+            if (!hr) { r.close(hs); bad++; continue; }
+            if (!r.send(hr, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) bad++;
+            else if (!r.recv(hr, NULL)) bad++;
+            r.close(hs);   /* close ONLY the session; children freed implicitly */
+        }
+        printf("sessiononly: %d iters, bad=%d\n", K, bad);
+        return bad ? 71 : 0;
     }
 
     int rc = do_one(&r);

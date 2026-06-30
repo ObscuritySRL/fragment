@@ -214,6 +214,62 @@ def main():
     time.sleep(0.3)
     check_origin("baseline bare (no DLL)", "/m13", rc, out)
 
+    # === audit-fix regressions (PR #1 review) ============================
+    # fix #4: a proxy mount path in FRAGMENT_PROXY must be preserved, so the
+    # WinHTTP object matches the curl backend's "<proxyPrefix><url>" exactly
+    # (curl would send /inspect/https://host/path; WinHTTP must too).
+    with lock:
+        hits.clear()
+    rc, out = run([HOST, DLL, url_of("https", "example.com", None, "/health")],
+                  env={"FRAGMENT_PROXY": "http://127.0.0.1:%d/inspect" % PROXY})
+    time.sleep(0.3)
+    check_proxy("proxy mount path preserved", PROXY,
+                "/inspect/https://example.com/health", "GET", rc, out)
+
+    # fix #3: when the proxy host is unusable (host-less FRAGMENT_PROXY leaves
+    # proxyHostW empty), the backend must be fully inert -- it must NOT strip
+    # the app's own NAMED_PROXY. The app proxies via :ALT, so the request must
+    # still reach :ALT (pre-fix it was forced NO_PROXY and reached nothing).
+    with lock:
+        hits.clear()
+    rc, out = run([HOST, DLL, url_of("http", "example.com", None, "/inert"),
+                   "appproxy", "127.0.0.1:%d" % ALT],
+                  env={"FRAGMENT_PROXY": "http://:%d" % PROXY})
+    time.sleep(0.3)
+    with lock:
+        snap = list(hits)
+    n_alt = sum(1 for po, _, _ in snap if po == ALT)
+    if n_alt >= 1:
+        results.append(("unusable proxy host -> app proxy honored", "PASS",
+                        "app NAMED_PROXY reached :%d" % ALT))
+    else:
+        landed = ", ".join(":%d%s" % (po, pa) for po, _, pa in snap) or "nothing"
+        results.append(("unusable proxy host -> app proxy honored", "FAIL",
+                        "wanted a hit on :%d; saw %s | rc=%s" % (ALT, landed, rc)))
+        if out:
+            print("---- unusable proxy host ----\n", out[-1200:])
+
+    # fix #1 guard: closing ONLY the session handle each cycle (WinHTTP frees
+    # the child connect/request handles implicitly) must still redirect every
+    # request -- exercises cascade eviction of the hConnect->origin map.
+    K = 8
+    with lock:
+        hits.clear()
+    rc, out = run([HOST, DLL, url_of("https", "example.com", None, "/sess"),
+                   "sessiononly", str(K)])
+    time.sleep(0.4)
+    want_s = expect_proxied("https", "example.com", None, "/sess")
+    with lock:
+        snap = list(hits)
+    n_s = sum(1 for po, _, pa in snap if po == PROXY and pa == want_s)
+    if n_s == K and rc == 0:
+        results.append(("session-only close x%d" % K, "PASS", "%d/%d on proxy" % (n_s, K)))
+    else:
+        results.append(("session-only close x%d" % K, "FAIL",
+                        "proxy=%d/%d | rc=%s" % (n_s, K, rc)))
+        if out:
+            print("---- session-only ----\n", out[-1200:])
+
     # --- shipped tool: fragment.exe launch + cross-process INJECT ---------
     if os.path.exists(FRAGMENT_EXE):
         with lock:

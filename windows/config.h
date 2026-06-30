@@ -48,6 +48,7 @@ typedef struct {
     wchar_t        proxyHostW[256]; /* proxy host, wide                     */
     unsigned short proxyPort;       /* proxy port                           */
     BOOL           proxySecure;     /* proxy base scheme == https           */
+    wchar_t        proxyPathW[512]; /* proxy mount path, wide; "" or "/p"   */
 } FragmentConfig;
 
 static FragmentConfig gCfg;
@@ -138,30 +139,46 @@ static void ConfigInit(void) {
     _snprintf_s(gCfg.proxyPrefix, sizeof(gCfg.proxyPrefix), _TRUNCATE, "%s/", base);
     gCfg.proxyPrefixLen = strlen(gCfg.proxyPrefix);
 
-    /* -- split the (validated) base into host / port / scheme. `base` is
-     *    "scheme://host[:port]" with no path or trailing slash here. IPv6
-     *    literals in [brackets] are not split (rare for a local proxy; set
+    /* -- split the (validated) base into scheme / host / port / mount-path.
+     *    `base` is "scheme://host[:port][/mount]" (trailing slashes already
+     *    stripped). The mount path is PRESERVED so the WinHTTP object name
+     *    matches the curl backend's "<proxyPrefix><url>" exactly. IPv6 literals
+     *    in [brackets] are not split (rare for a local proxy; set
      *    FRAGMENT_PROXY_HOST/PORT explicitly for those). */
     {
         const char* sep   = strstr(base, "://");
         const char* host0 = sep ? sep + 3 : base;
-        const char* colon = strrchr(host0, ':');
+        /* the authority is host[:port]; everything from the first '/' on is the
+         * proxy mount path (e.g. "/inspect"). */
+        const char* pathBeg = strchr(host0, '/');
+        const char* authEnd = pathBeg ? pathBeg : host0 + strlen(host0);
+        const char* colon   = NULL;
+        for (const char* q = host0; q < authEnd; ++q) if (*q == ':') colon = q;
         char host[256];
         gCfg.proxySecure = (sep && (size_t)(sep - base) == 5 && !_strnicmp(base, "https", 5));
-        if (colon && colon[1]) {
+        if (colon && colon + 1 < authEnd) {
             size_t hl = (size_t)(colon - host0);
             if (hl >= sizeof(host)) hl = sizeof(host) - 1;
             memcpy(host, host0, hl);
             host[hl] = 0;
             gCfg.proxyPort = (unsigned short) atoi(colon + 1);
         } else {
-            _snprintf_s(host, sizeof(host), _TRUNCATE, "%s", host0);
+            size_t hl = (size_t)(authEnd - host0);
+            if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+            memcpy(host, host0, hl);
+            host[hl] = 0;
             gCfg.proxyPort = gCfg.proxySecure ? 443 : 80;
         }
         if (!MultiByteToWideChar(CP_ACP, 0, host, -1, gCfg.proxyHostW,
                                  (int)(sizeof(gCfg.proxyHostW) / sizeof(wchar_t))))
             gCfg.proxyHostW[0] = 0;
-        LogDebug("[Fragment] proxy split: host=%ls port=%u secure=%d\n",
-                 gCfg.proxyHostW, (unsigned) gCfg.proxyPort, (int) gCfg.proxySecure);
+        gCfg.proxyPathW[0] = 0;                       /* default: no mount path */
+        if (pathBeg && pathBeg[0] &&
+            !MultiByteToWideChar(CP_ACP, 0, pathBeg, -1, gCfg.proxyPathW,
+                                 (int)(sizeof(gCfg.proxyPathW) / sizeof(wchar_t))))
+            gCfg.proxyPathW[0] = 0;                   /* conversion failed      */
+        LogDebug("[Fragment] proxy split: host=%ls port=%u secure=%d path=%ls\n",
+                 gCfg.proxyHostW, (unsigned) gCfg.proxyPort, (int) gCfg.proxySecure,
+                 gCfg.proxyPathW[0] ? gCfg.proxyPathW : L"(none)");
     }
 }

@@ -57,7 +57,8 @@ static WhSetOptionFn   gWhSetOption   = NULL;
 
 /* ---- hConnect -> original (host, port) map ---------------------------- */
 typedef struct WhConn {
-    HINTERNET      handle;
+    HINTERNET      handle;   /* connection handle (map key)           */
+    HINTERNET      session;  /* parent session handle (cascade evict) */
     wchar_t*       host;     /* original server name (owned)          */
     INTERNET_PORT  port;     /* original port (0 == INTERNET_DEFAULT) */
     struct WhConn* next;
@@ -65,22 +66,16 @@ typedef struct WhConn {
 
 static WhConn*          gWhConns = NULL;
 static CRITICAL_SECTION gWhLock;
+static volatile LONG    gWhLockReady = 0;   /* set AFTER gWhLock is constructed */
 
-/* One-time init of gWhLock. Runs inside HookWinHttp BEFORE any winhttp export is
- * hooked, so it always precedes the first detour that touches the map. */
-static void WhEnsureInit(void) {
-    static volatile LONG once = 0;
-    if (InterlockedCompareExchange(&once, 1, 0) == 0)
-        InitializeCriticalSection(&gWhLock);
-}
-
-static void WhRemember(HINTERNET h, LPCWSTR host, INTERNET_PORT port) {
+static void WhRemember(HINTERNET session, HINTERNET h, LPCWSTR host, INTERNET_PORT port) {
     if (!h) return;
     WhConn* e = (WhConn*) malloc(sizeof(WhConn));
     if (!e) return;
-    e->handle = h;
-    e->port   = port;
-    e->host   = host ? _wcsdup(host) : NULL;
+    e->handle  = h;
+    e->session = session;
+    e->port    = port;
+    e->host    = host ? _wcsdup(host) : NULL;
     EnterCriticalSection(&gWhLock);
     e->next  = gWhConns;
     gWhConns = e;
@@ -105,15 +100,22 @@ static BOOL WhLookup(HINTERNET h, wchar_t** outHost, INTERNET_PORT* outPort) {
     return found;
 }
 
+/* Evict every entry whose connection handle OR parent session handle is `h`.
+ * Closing the session handle is the common teardown that frees its child
+ * connection handles implicitly -- never through this hooked close -- so
+ * matching on the session too is what keeps the map from growing without
+ * bound. */
 static void WhForget(HINTERNET h) {
     EnterCriticalSection(&gWhLock);
-    for (WhConn** pp = &gWhConns; *pp; pp = &(*pp)->next) {
-        if ((*pp)->handle == h) {
-            WhConn* dead = *pp;
-            *pp = dead->next;
-            free(dead->host);
-            free(dead);
-            break;
+    WhConn** pp = &gWhConns;
+    while (*pp) {
+        WhConn* cur = *pp;
+        if (cur->handle == h || cur->session == h) {
+            *pp = cur->next;
+            free(cur->host);
+            free(cur);
+        } else {
+            pp = &cur->next;
         }
     }
     LeaveCriticalSection(&gWhLock);
@@ -123,10 +125,12 @@ static void WhForget(HINTERNET h) {
 
 /* Force a DIRECT session: the proxy IS our destination, so an app's upstream
  * proxy must not be interposed between the target and 127.0.0.1:9020. Mirrors
- * the curl backend forcing CURLOPT_PROXY="". */
+ * the curl backend forcing CURLOPT_PROXY="". Gated on a usable proxy host: with
+ * none, the backend is inert (WhConnectDetour passes through), so forcing
+ * NO_PROXY here would strip the app's own proxy and strand it. */
 static HINTERNET WINAPI WhOpenDetour(LPCWSTR agent, DWORD accessType, LPCWSTR proxy,
                                      LPCWSTR proxyBypass, DWORD flags) {
-    if (accessType != WINHTTP_ACCESS_TYPE_NO_PROXY) {
+    if (gCfg.proxyHostW[0] && accessType != WINHTTP_ACCESS_TYPE_NO_PROXY) {
         LogDebug("[winhttp] WinHttpOpen: forcing NO_PROXY (was %lu)\n", accessType);
         accessType  = WINHTTP_ACCESS_TYPE_NO_PROXY;
         proxy       = WINHTTP_NO_PROXY_NAME;
@@ -144,7 +148,7 @@ static HINTERNET WINAPI WhConnectDetour(HINTERNET session, LPCWSTR server,
 
     HINTERNET h = gWhConnect(session, gCfg.proxyHostW, (INTERNET_PORT) gCfg.proxyPort, reserved);
     if (h) {
-        WhRemember(h, server, port);
+        WhRemember(session, h, server, port);
         LogDebug("[winhttp] WinHttpConnect: %ls:%u -> %ls:%u (h=0x%p)\n",
                  server ? server : L"(null)", (unsigned) port,
                  gCfg.proxyHostW, (unsigned) gCfg.proxyPort, h);
@@ -152,9 +156,11 @@ static HINTERNET WINAPI WhConnectDetour(HINTERNET session, LPCWSTR server,
     return h;
 }
 
-/* Rebuild the object name to /<origin-scheme>://<host>[:port]<path> so the proxy
- * receives the full original URL, and set the request's secure flag from the
- * PROXY's scheme (what we speak to 127.0.0.1:9020), not the origin's. */
+/* Rebuild the object name to <mount>/<origin-scheme>://<host>[:port]<path> so the
+ * proxy receives the full original URL (the optional <mount> is the proxy's own
+ * path prefix, kept in lock-step with the curl backend's "<proxyPrefix><url>"),
+ * and set the request's secure flag from the PROXY's scheme (what we speak to
+ * 127.0.0.1:9020), not the origin's. */
 static HINTERNET WINAPI WhOpenRequestDetour(HINTERNET connect, LPCWSTR verb,
                                             LPCWSTR object, LPCWSTR version,
                                             LPCWSTR referrer, LPCWSTR* acceptTypes,
@@ -170,15 +176,16 @@ static HINTERNET WINAPI WhOpenRequestDetour(HINTERNET connect, LPCWSTR verb,
         const wchar_t* path         = (object && *object) ? object : L"/";
         const wchar_t* lead         = (path[0] == L'/') ? L"" : L"/";
 
-        size_t cap = 1 + 5 + 3 + (host ? wcslen(host) : 0) + 6 + 1 + wcslen(path) + 1;
+        const wchar_t* mount = gCfg.proxyPathW;   /* "" or "/inspect" (no trailing /) */
+        size_t cap = wcslen(mount) + 1 + 5 + 3 + (host ? wcslen(host) : 0) + 6 + 1 + wcslen(path) + 1;
         newObject = (wchar_t*) malloc(cap * sizeof(wchar_t));
         if (newObject) {
             if (origPort != 0 && origPort != defPort)
-                _snwprintf_s(newObject, cap, _TRUNCATE, L"/%ls://%ls:%u%ls%ls",
-                             scheme, host ? host : L"", (unsigned) origPort, lead, path);
+                _snwprintf_s(newObject, cap, _TRUNCATE, L"%ls/%ls://%ls:%u%ls%ls",
+                             mount, scheme, host ? host : L"", (unsigned) origPort, lead, path);
             else
-                _snwprintf_s(newObject, cap, _TRUNCATE, L"/%ls://%ls%ls%ls",
-                             scheme, host ? host : L"", lead, path);
+                _snwprintf_s(newObject, cap, _TRUNCATE, L"%ls/%ls://%ls%ls%ls",
+                             mount, scheme, host ? host : L"", lead, path);
             object = newObject;
             LogDebug("[winhttp] WinHttpOpenRequest -> %ls\n", newObject);
         }
@@ -194,8 +201,9 @@ static HINTERNET WINAPI WhOpenRequestDetour(HINTERNET connect, LPCWSTR verb,
     return h;
 }
 
-/* Evict the origin entry before the handle value can be recycled by a later
- * WinHttpConnect (closing hSession/hRequest finds nothing and is a no-op). */
+/* Evict the connection entry (and any siblings sharing this session handle)
+ * before the handle value can be recycled by a later WinHttpConnect. Closing a
+ * request handle matches nothing and is a no-op. */
 static BOOL WINAPI WhCloseDetour(HINTERNET h) {
     WhForget(h);
     return gWhClose(h);
@@ -207,7 +215,10 @@ static BOOL WINAPI WhCloseDetour(HINTERNET h) {
  * forced at WinHttpOpen. Report success so the app proceeds; the session stays
  * direct (mirrors the curl backend dropping CURLOPT_PROXY). */
 static BOOL WINAPI WhSetOptionDetour(HINTERNET h, DWORD option, LPVOID buf, DWORD len) {
-    if (option == WINHTTP_OPTION_PROXY) {
+    /* Only swallow the proxy re-set when we have a proxy of our own to protect;
+     * with no usable proxy host the backend is inert, so let the app set its
+     * proxy normally (consistent with WhOpenDetour and WhConnectDetour). */
+    if (gCfg.proxyHostW[0] && option == WINHTTP_OPTION_PROXY) {
         LogDebug("[winhttp] swallow WinHttpSetOption(WINHTTP_OPTION_PROXY)\n");
         return TRUE;
     }
@@ -248,9 +259,16 @@ void HookWinHttp(HMODULE module) {
         if (*p == '\\' || *p == '/') nm = p + 1;
     if (!WhIsWinHttp(module, nm)) return;
 
-    WhEnsureInit();
-
     if (gHookLockReady) EnterCriticalSection(&gHookLock);
+    /* Construct gWhLock exactly once, serialized by gHookLock (or single-threaded
+     * during the DllMain sweep, before gHookLock is ready). Publishing
+     * gWhLockReady only AFTER InitializeCriticalSection completes -- and binding
+     * the detours that use gWhLock below under this same lock -- guarantees no
+     * detour can ever enter an unconstructed section (mirrors HookLockInit). */
+    if (!gWhLockReady) {
+        InitializeCriticalSection(&gWhLock);
+        InterlockedExchange(&gWhLockReady, 1);
+    }
     WhInstall(module, "WinHttpOpen",        (LPVOID) &WhOpenDetour,        (LPVOID*) &gWhOpen);
     WhInstall(module, "WinHttpConnect",     (LPVOID) &WhConnectDetour,     (LPVOID*) &gWhConnect);
     WhInstall(module, "WinHttpOpenRequest", (LPVOID) &WhOpenRequestDetour, (LPVOID*) &gWhOpenRequest);
