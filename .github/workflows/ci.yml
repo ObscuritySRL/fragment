@@ -197,7 +197,7 @@ jobs:
 
       - name: Install 32-bit regression toolchains
         if: runner.arch == 'X64'
-        run: sudo apt-get install -y --no-install-recommends gcc-i686-linux-gnu gcc-arm-linux-gnueabihf qemu-user
+        run: sudo apt-get install -y --no-install-recommends gcc-i686-linux-gnu libc6-dev-i386-cross gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user
 
       - uses: oven-sh/setup-bun@v2
 
