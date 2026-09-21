@@ -94,7 +94,9 @@ static int do_one(Req* r) {
                               WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!hr) { r->close(hc); r->close(hs); return 3; }
     int rc = 0;
-    if (!r->send(hr, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) rc = 4;
+    const char* body = !wcscmp(r->verbW, L"POST") ? "fragment-body=hello" : NULL;
+    DWORD bodyLen = body ? (DWORD) strlen(body) : 0;
+    if (!r->send(hr, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (LPVOID) body, bodyLen, bodyLen, 0)) rc = 4;
     else if (!r->recv(hr, NULL)) rc = 5;
     r->close(hr); r->close(hc); r->close(hs);
     return rc;

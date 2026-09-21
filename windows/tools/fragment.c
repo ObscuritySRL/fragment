@@ -106,8 +106,22 @@ static ULONG_PTR remote_loadlibrarya(HANDLE hProc, int wow64) {
     return rva ? img.base + rva : 0;
 }
 
-/* Inject dllPath into an already-opened process; `wow64` selects how the remote
- * LoadLibraryA is resolved. Returns 1 on apparent success. */
+/* Verify the actual module, not the low DWORD of a pointer returned through a
+ * thread exit code (which can also contain an exception status). */
+static int module_loaded(HANDLE process, const char* path) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                                           GetProcessId(process));
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    MODULEENTRY32 me = { sizeof(me) };
+    int found = 0;
+    if (Module32First(snap, &me)) do {
+        if (!_stricmp(me.szExePath, path)) { found = 1; break; }
+    } while (Module32Next(snap, &me));
+    CloseHandle(snap);
+    return found;
+}
+
+/* Inject and confirm the DLL is mapped. Hook/capture status is separate. */
 static int inject_into(HANDLE hProc, const char* dllPath, int wow64) {
     ULONG_PTR llp = remote_loadlibrarya(hProc, wow64);
     if (!llp) {
@@ -132,7 +146,12 @@ static int inject_into(HANDLE hProc, const char* dllPath, int wow64) {
     }
     DWORD loaded = 0;
     if (WaitForSingleObject(th, 15000) == WAIT_OBJECT_0) {
-        GetExitCodeThread(th, &loaded);             /* low 32 bits of the HMODULE */
+        loaded = (DWORD) module_loaded(hProc, dllPath);
+        if (!loaded) {
+            DWORD result = 0;
+            GetExitCodeThread(th, &result);
+            fprintf(stderr, "[fragment] DLL absent from target module list (remote thread result 0x%08lX)\n", result);
+        }
         VirtualFreeEx(hProc, rem, 0, MEM_RELEASE);  /* safe: remote thread finished */
     } else {
         /* A slow DllMain is still running LoadLibraryA -- do NOT free the path
@@ -189,6 +208,8 @@ int main(int argc, char** argv) {
     if (pid == 0 && launchIdx < 0) { usage(); return 2; }
     if (pid != 0 && launchIdx >= 0) { fprintf(stderr, "[fragment] choose either --pid or -- <program>, not both\n"); return 2; }
     if (launchIdx >= 0 && launchIdx >= argc) { fprintf(stderr, "[fragment] '--' must be followed by a program\n"); return 2; }
+    if (pid && (proxy || host || port || log || logfile || loader || off))
+        fprintf(stderr, "[fragment] --pid uses the target's existing environment; configuration flags cannot change it\n");
 
     /* The DLL is resolved AFTER the target is opened and its bitness is known,
      * so the default picks Fragment.dll vs Fragment32.dll to match the target. */
@@ -237,7 +258,7 @@ int main(int argc, char** argv) {
         if (wow) ResumeThread(pi.hThread);
         int ok = inject_into(pi.hProcess, path, wow);
         if (!wow) ResumeThread(pi.hThread);
-        if (ok) printf("[fragment] injected into pid %lu\n", pi.dwProcessId);
+        if (ok) printf("[fragment] DLL loaded in pid %lu; hook installation and traffic capture are not verified. Check Fragment logs and your proxy.\n", pi.dwProcessId);
         else    fprintf(stderr, "[fragment] injection failed; target runs un-proxied\n");
         WaitForSingleObject(pi.hProcess, INFINITE);
         DWORD ec = 0;
@@ -256,7 +277,7 @@ int main(int argc, char** argv) {
         int ok = inject_into(hProc, path, wow);
         CloseHandle(hProc);
         if (!ok) { fprintf(stderr, "[fragment] injection into pid %lu failed\n", pid); return 5; }
-        printf("[fragment] injected into pid %lu\n", pid);
+        printf("[fragment] DLL loaded in pid %lu; hook installation and traffic capture are not verified. Check Fragment logs and your proxy.\n", pid);
         return 0;
     }
 }

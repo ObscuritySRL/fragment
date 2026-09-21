@@ -14,6 +14,7 @@
  */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CURLOPT_URL              10002
@@ -62,7 +63,8 @@ int main(int argc, char** argv) {
         snprintf(path, sizeof(path), "/%s", marker);
         curl_url_set(uh, CURLUPART_SCHEME, "http", 0);
         curl_url_set(uh, CURLUPART_HOST, "127.0.0.1", 0);
-        curl_url_set(uh, CURLUPART_PORT, "9999", 0);
+        const char* testPort = getenv("FRAGMENT_TEST_ORIGIN_PORT");
+        curl_url_set(uh, CURLUPART_PORT, testPort ? testPort : "9999", 0);
         curl_url_set(uh, CURLUPART_PATH, path, 0);
     } else {
         curl_url_set(uh, CURLUPART_URL, url, 0);

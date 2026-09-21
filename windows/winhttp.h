@@ -54,6 +54,7 @@ static WhConnectFn     gWhConnect     = NULL;
 static WhOpenRequestFn gWhOpenRequest = NULL;
 static WhCloseHandleFn gWhClose       = NULL;
 static WhSetOptionFn   gWhSetOption   = NULL;
+static volatile LONG  gWhActive      = 0; /* all five hooks must be usable */
 
 /* ---- hConnect -> original (host, port) map ---------------------------- */
 typedef struct WhConn {
@@ -68,18 +69,20 @@ static WhConn*          gWhConns = NULL;
 static CRITICAL_SECTION gWhLock;
 static volatile LONG    gWhLockReady = 0;   /* set AFTER gWhLock is constructed */
 
-static void WhRemember(HINTERNET session, HINTERNET h, LPCWSTR host, INTERNET_PORT port) {
-    if (!h) return;
+static BOOL WhRemember(HINTERNET session, HINTERNET h, LPCWSTR host, INTERNET_PORT port) {
+    if (!h || !host) return FALSE;
     WhConn* e = (WhConn*) malloc(sizeof(WhConn));
-    if (!e) return;
+    if (!e) return FALSE;
     e->handle  = h;
     e->session = session;
     e->port    = port;
     e->host    = host ? _wcsdup(host) : NULL;
+    if (!e->host) { free(e); return FALSE; }
     EnterCriticalSection(&gWhLock);
     e->next  = gWhConns;
     gWhConns = e;
     LeaveCriticalSection(&gWhLock);
+    return TRUE;
 }
 
 /* Copy the origin for `h` into caller storage (caller frees *outHost).
@@ -130,7 +133,7 @@ static void WhForget(HINTERNET h) {
  * NO_PROXY here would strip the app's own proxy and strand it. */
 static HINTERNET WINAPI WhOpenDetour(LPCWSTR agent, DWORD accessType, LPCWSTR proxy,
                                      LPCWSTR proxyBypass, DWORD flags) {
-    if (gCfg.proxyHostW[0] && accessType != WINHTTP_ACCESS_TYPE_NO_PROXY) {
+    if (gWhActive && gCfg.proxyHostW[0] && accessType != WINHTTP_ACCESS_TYPE_NO_PROXY) {
         LogDebug("[winhttp] WinHttpOpen: forcing NO_PROXY (was %lu)\n", accessType);
         accessType  = WINHTTP_ACCESS_TYPE_NO_PROXY;
         proxy       = WINHTTP_NO_PROXY_NAME;
@@ -143,12 +146,16 @@ static HINTERNET WINAPI WhOpenDetour(LPCWSTR agent, DWORD accessType, LPCWSTR pr
  * keyed by the returned handle, for WinHttpOpenRequest to rebuild. */
 static HINTERNET WINAPI WhConnectDetour(HINTERNET session, LPCWSTR server,
                                         INTERNET_PORT port, DWORD reserved) {
-    if (!gCfg.proxyHostW[0])                     /* no usable proxy host: pass through */
+    if (!gWhActive || !gCfg.proxyHostW[0])        /* incomplete backend: pass through */
         return gWhConnect(session, server, port, reserved);
 
     HINTERNET h = gWhConnect(session, gCfg.proxyHostW, (INTERNET_PORT) gCfg.proxyPort, reserved);
     if (h) {
-        WhRemember(session, h, server, port);
+        if (!WhRemember(session, h, server, port)) {
+            gWhClose(h);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
         LogDebug("[winhttp] WinHttpConnect: %ls:%u -> %ls:%u (h=0x%p)\n",
                  server ? server : L"(null)", (unsigned) port,
                  gCfg.proxyHostW, (unsigned) gCfg.proxyPort, h);
@@ -170,6 +177,7 @@ static HINTERNET WINAPI WhOpenRequestDetour(HINTERNET connect, LPCWSTR verb,
     wchar_t*      newObject = NULL;
 
     if (WhLookup(connect, &host, &origPort)) {
+        if (!host) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
         BOOL           originSecure = (flags & WINHTTP_FLAG_SECURE) != 0;
         const wchar_t* scheme       = originSecure ? L"https" : L"http";
         INTERNET_PORT  defPort      = originSecure ? 443 : 80;
@@ -179,6 +187,11 @@ static HINTERNET WINAPI WhOpenRequestDetour(HINTERNET connect, LPCWSTR verb,
         const wchar_t* mount = gCfg.proxyPathW;   /* "" or "/inspect" (no trailing /) */
         size_t cap = wcslen(mount) + 1 + 5 + 3 + (host ? wcslen(host) : 0) + 6 + 1 + wcslen(path) + 1;
         newObject = (wchar_t*) malloc(cap * sizeof(wchar_t));
+        if (!newObject) {
+            free(host);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
         if (newObject) {
             if (origPort != 0 && origPort != defPort)
                 _snwprintf_s(newObject, cap, _TRUNCATE, L"%ls/%ls://%ls:%u%ls%ls",
@@ -218,7 +231,7 @@ static BOOL WINAPI WhSetOptionDetour(HINTERNET h, DWORD option, LPVOID buf, DWOR
     /* Only swallow the proxy re-set when we have a proxy of our own to protect;
      * with no usable proxy host the backend is inert, so let the app set its
      * proxy normally (consistent with WhOpenDetour and WhConnectDetour). */
-    if (gCfg.proxyHostW[0] && option == WINHTTP_OPTION_PROXY) {
+    if (gWhActive && gCfg.proxyHostW[0] && option == WINHTTP_OPTION_PROXY) {
         LogDebug("[winhttp] swallow WinHttpSetOption(WINHTTP_OPTION_PROXY)\n");
         return TRUE;
     }
@@ -274,5 +287,11 @@ void HookWinHttp(HMODULE module) {
     WhInstall(module, "WinHttpOpenRequest", (LPVOID) &WhOpenRequestDetour, (LPVOID*) &gWhOpenRequest);
     WhInstall(module, "WinHttpCloseHandle", (LPVOID) &WhCloseDetour,       (LPVOID*) &gWhClose);
     WhInstall(module, "WinHttpSetOption",   (LPVOID) &WhSetOptionDetour,   (LPVOID*) &gWhSetOption);
+    if (gWhOpen && gWhConnect && gWhOpenRequest && gWhClose && gWhSetOption) {
+        InterlockedExchange(&gWhActive, 1);
+        LogInfo("[winhttp] backend ready (five hooks installed)\n");
+    } else {
+        LogWarn("[winhttp] backend inactive: incomplete hook installation\n");
+    }
     if (gHookLockReady) LeaveCriticalSection(&gHookLock);
 }

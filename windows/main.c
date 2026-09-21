@@ -75,6 +75,8 @@ CURLcode CurlSetoptDetourWithInstance(CurlSetoptCtx* ctx, LPVOID curl, CURLoptio
                 }
                 ctx->urlFree(cur);
             }
+        } else if (uh) {
+            LogWarn("[setopt] CURLOPT_CURLU cannot be rewritten: URL API exports unavailable\n");
         }
     } else if (option == CURLOPT_RESOLVE || option == CURLOPT_CONNECT_TO ||
                option == CURLOPT_UNIX_SOCKET_PATH ||
@@ -148,13 +150,14 @@ static const CurlSig kSetoptSigs[] = {
     // spill r8/r9; mov rax,[rbx]; xor eax,eax; test rcx,rcx.
     { "\x53\x48\x83\xEC\x00\x48\x8B\x1D\x00\x00\x00\x00\x4C\x89\x44\x24\x00\x4C\x89\x4C\x24\x00\x48\x8B\x03\x48\x89\x44\x24\x00\x31\xC0\x48\x85\xC9",
       "xxxx?xxx????xxxx?xxxx?xxxxxxx?xxxxx" },
-    // Clang/LLVM (curl-for-win), with CET endbr64; mov eax,0x2b
-    // (CURLE_BAD_FUNCTION_ARGUMENT); test rcx,rcx.
-    { "\xF3\x0F\x1E\xFA\x55\x56\x57\x48\x83\xEC\x00\x48\x8D\x6C\x24\x00\x4C\x89\x45\x00\x4C\x89\x4D\x00\xB8\x2B\x00\x00\x00\x48\x85\xC9",
-      "xxxxxxxxxx?xxxx?xxx?xxx?xxxxxxxx" },
-    // Same as above without endbr64 (CET-disabled clang builds).
-    { "\x55\x56\x57\x48\x83\xEC\x00\x48\x8D\x6C\x24\x00\x4C\x89\x45\x00\x4C\x89\x4D\x00\xB8\x2B\x00\x00\x00\x48\x85\xC9",
-      "xxxxxx?xxxx?xxx?xxx?xxxxxxxx" },
+    // curl-for-win 8.20.0_1. The old short clang prefix also matched
+    // curl_share_setopt in 8.22; retain the observed argument setup here.
+    { "\xF3\x0F\x1E\xFA\x55\x56\x57\x48\x83\xEC\x30\x48\x8D\x6C\x24\x30\x4C\x89\x45\x30\x4C\x89\x4D\x38\xB8\x2B\x00\x00\x00\x48\x85\xC9\x74\x2E\x89\xD6\x4C\x8D\x45\x30\x4C\x89\x45\xF8\x48\x89\xCF",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+    // curl-for-win 8.22.0_1, clang 23: exact exported body also occurs once
+    // in the matching static curl.exe. Keep the symbol-name gate unchanged.
+    { "\xF3\x0F\x1E\xFA\x55\x56\x57\x53\x48\x83\xEC\x28\x48\x8D\x6C\x24\x20\x4C\x89\x45\x40\x4C\x89\x4D\x48\xB8\x2B\x00\x00\x00\x48\x85\xC9\x0F\x84\xA1\x00\x00\x00\x81\x39\xAD\xDB\xDE\xC0\x0F\x85\x95",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
 };
 #elif defined(_M_IX86) || defined(__i386__)
 // Best-effort 32-bit __cdecl frame prologues (MSVC hotpatch `mov edi,edi` + the
@@ -194,6 +197,9 @@ static const CurlSig kUrlSetSigs[] = {
     // sub rsp,imm32; lea rbp,[rsp+disp32]; test rcx,rcx; je.
     { "\xF3\x0F\x1E\xFA\x55\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x53\x48\x81\xEC\x00\x00\x00\x00\x48\x8D\xAC\x24\x00\x00\x00\x00\x48\x85\xC9\x74\x00\x4D\x89\xC6\x89\xD3\x48\x89\xCE\x4D\x85\xC0",
       "xxxxxxxxxxxxxxxxxxx????xxxx????xxxx?xxxxxxxxxxx" },
+    // curl-for-win 8.22.0_1, clang 23, smaller stack frame.
+    { "\xF3\x0F\x1E\xFA\x55\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x53\x48\x83\xEC\x78\x48\x8D\x6C\x24\x70\x48\x85\xC9\x74\x75\x4D\x89\xC4\x41\x89\xD5\x48\x89\xCE\x4D\x85\xC0\x74\x71\x45\x89\xCF\x4C",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
 };
 #elif defined(_M_IX86) || defined(__i386__)
 // curl_url_set frame prologues for a statically-linked x86 program (best-effort;
@@ -248,8 +254,14 @@ static LPVOID ResolveCurlFn(HMODULE module, PBYTE base, SIZE_T size, const char*
     // never costs coverage for DLL curl -- it only avoids scanning every
     // unrelated module the loader notification reports.
     if (!target && allowSig && ModuleContainsAscii(base, size, name)) {
-        for (size_t i = 0; i < nsigs && !target; ++i)
-            target = FindPattern(base, size, sigs[i].pattern, sigs[i].mask);
+        for (size_t i = 0; i < nsigs; ++i) {
+            LPVOID candidate = FindPattern(base, size, sigs[i].pattern, sigs[i].mask);
+            if (candidate && target && candidate != target) {
+                LogWarn("[hook] ambiguous signatures for %s; leaving unhooked\n", name);
+                return NULL;
+            }
+            if (candidate) target = candidate;
+        }
         *how = "signature";
     }
     return target ? FollowThunks(target) : NULL;
