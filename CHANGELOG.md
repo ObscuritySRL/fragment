@@ -4,7 +4,23 @@ All notable changes to **Fragment** are documented in this file.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-21
+
 ### Added
+- Windows WinHTTP interception with connection/session tracking, original URL reconstruction, proxy-option neutralization, proxy mount paths, and activation only after all five hooks are installed.
+- Bun-native recording-server integration matrices, binary/signature inspection tools, and a forwarding proxy. WinHTTP coverage includes POST bodies, bare/disabled controls, session cleanup, launcher injection, and concurrent requests.
+- WinHTTP partial-activation and allocation-failure unit coverage on Windows x64 and x86.
+
+### Fixed
+- Publish hook trampolines before enabling detours; fail safely when WinHTTP cannot retain origin metadata or allocate a rewritten path.
+- Confirm Windows DLL injection through the target's module list, keeping DLL loading separate from hook installation and verified proxy traffic.
+- Reject ambiguous curl signature matches and tighten the observed Clang signatures. Discover embedded curl in unrelated DLL filenames while retaining symbol-marker and signature checks.
+
+### Release scope
+- Packages contain Windows x64 and Linux x64/ARM64 builds. Windows x86, WOW64, and ARM64 have separate CI coverage; no additional architecture package is implied.
+- Existing WinHTTP connections opened before hook installation lack origin metadata and pass through. Unknown static curl builds remain best-effort. Fixture results do not establish third-party application compatibility.
+
+### Architecture support
 - **i386 (IA-32) engine backend** (`common/arch/i386/decode.h`) unlocking **`linux-i386`** (and, later, `windows-x86`) from one decoder. The x86 prologue length-decoder is now a single mode-parameterized core (`common/arch/x86/decode.h`, `FR_X86_BITS` ∈ {32, 64}) that both `x86_64/decode.h` and `i386/decode.h` select into, so a decode fix lands for every x86 width at once and the 64-bit ports' include path is unchanged. The IA-32 deltas: `0x40`–`0x4F` decode as `INC/DEC reg` (no REX prefix), a bare `disp32` is an absolute address that copies verbatim (no RIP-relative form), a `mov`-immediate is never REX.W-widened, the stack-protector `mov eax, gs:0x14` canary (`moffs32`) is decoded, and 16-bit operand/address overrides (`0x66` rel16 / `0x67`) fail closed rather than mis-length.
 - **i386 inline-hook glue** (`linux/hook.h`): an `E9 rel32` patch — which reaches the whole 4 GB on IA-32, so there is no near-allocation limit — to a relay whose absolute jump is a register-free `push imm32; ret`, plus a `__cdecl` caller stub (`linux/util.h`) that builds a fresh, 16-byte-aligned call frame to prepend the per-hook context the shared C detour expects.
 - **ELF-class-agnostic symbol resolution** — `ElfFindSym` now reads either ELF class through `ElfW(...)`, so a 32-bit Fragment resolves a 32-bit module's `.symtab` / `.dynsym` while the 64-bit ports stay byte-for-byte unchanged.

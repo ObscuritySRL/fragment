@@ -1,4 +1,5 @@
 import { Matrix, mustRun, run, type Env } from '../../test/harness';
+import { embeddedCases } from './embedded';
 
 if (process.platform !== 'win32') throw new Error('Use linux/test/run.ts on Linux');
 const root = `${import.meta.dir}/..`;
@@ -20,6 +21,7 @@ async function hostCase(name: string, lib: string, args: string[] = [], env: Env
 try {
   for (const [name, cmd] of [
     ['hook engine', [`${build}/hooktest.exe`]],
+    ['WinHTTP state and allocation failures', [`${build}/winhttptest.exe`]],
     ['mock curl', [`${build}/host_mock.exe`, dll, `${build}/mockcurl.dll`]],
   ] as [string, string[]][]) {
     const { rc, out } = await run(cmd);
@@ -31,6 +33,7 @@ try {
   if (!libs.size) m.skip('real shared curl matrix', 'stage test/curl/libcurl*.dll or supply --libcurl <path>');
   for (const lib of libs) {
     console.log(`Testing actual library: ${lib}`);
+    await embeddedCases(m, lib, build, dll, config);
     await hostCase('export URL rewrite', lib);
     await hostCase('bare negative control', lib, ['--noinject'], {}, false);
     await hostCase('off switch', lib, [], { FRAGMENT_ENABLED: '0' }, false);

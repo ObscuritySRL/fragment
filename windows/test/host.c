@@ -14,6 +14,7 @@
  * version since well before 7.30, so hardcoding the numbers is safe.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <windows.h>
 
 #define CURLOPT_PORT                 3
@@ -46,14 +47,19 @@ int main(int argc, char **argv) {
     const char *curlPath = argv[2];
     const char *url = (argc > 3) ? argv[3] : "http://127.0.0.1:9999/ORIG";
 
-    int noinject = 0, setPort = 0, useLdrEx = 0;
+    int noinject = 0, setPort = 0, useLdrEx = 0, preload = 0, post = 0;
+    unsigned long setoptRva = 0;
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--noinject") == 0) noinject = 1;
         if (strcmp(argv[i], "port") == 0) setPort = 1;
         if (strcmp(argv[i], "ldrex") == 0) useLdrEx = 1;   /* load curl via LoadLibraryExW */
+        if (strcmp(argv[i], "--preload") == 0) preload = 1;
+        if (strcmp(argv[i], "--post") == 0) post = 1;
+        if (strcmp(argv[i], "--setopt-rva") == 0 && i + 1 < argc)
+            setoptRva = strtoul(argv[++i], NULL, 10);
     }
 
-    if (!noinject) {
+    if (!noinject && !preload) {
         HMODULE hf = LoadLibraryA(fragPath);
         if (!hf) { fprintf(stderr, "[host] LoadLibrary(Fragment) failed %lu\n", GetLastError()); return 3; }
         printf("[host] Fragment loaded @ %p\n", (void*)hf);
@@ -82,6 +88,9 @@ int main(int argc, char **argv) {
         hc = LoadLibraryA(curlPath);
     }
     if (!hc) { fprintf(stderr, "[host] LoadLibrary(curl) failed %lu\n", GetLastError()); return 4; }
+    if (!noinject && preload && !LoadLibraryA(fragPath)) {
+        fprintf(stderr, "[host] late Fragment load failed %lu\n", GetLastError()); return 3;
+    }
     printf("[host] curl loaded @ %p (%s)\n", (void*)hc, curlPath);
 
     curl_global_init_t  cgi = (curl_global_init_t) (void*)GetProcAddress(hc, "curl_global_init");
@@ -89,6 +98,12 @@ int main(int argc, char **argv) {
     curl_easy_setopt_t  ces = (curl_easy_setopt_t) (void*)GetProcAddress(hc, "curl_easy_setopt");
     curl_easy_perform_t cep = (curl_easy_perform_t)(void*)GetProcAddress(hc, "curl_easy_perform");
     curl_easy_cleanup_t cec = (curl_easy_cleanup_t)(void*)GetProcAddress(hc, "curl_easy_cleanup");
+    /* The offline fixture removes the setopt export but retains its body and
+     * marker. Only this test host knows the original RVA; Fragment must find it. */
+    if (setoptRva) {
+        if (ces) { fprintf(stderr, "[host] fixture still exports setopt\n"); return 5; }
+        ces = (curl_easy_setopt_t)(void*)((BYTE*)hc + setoptRva);
+    }
     if (!cei || !ces || !cep) { fprintf(stderr, "[host] missing curl exports\n"); return 5; }
 
     if (cgi) cgi(CURL_GLOBAL_DEFAULT);
@@ -96,6 +111,7 @@ int main(int argc, char **argv) {
     if (!h) { fprintf(stderr, "[host] curl_easy_init returned NULL\n"); return 6; }
 
     ces(h, CURLOPT_URL, url);
+    if (post) ces(h, 10015 /* CURLOPT_POSTFIELDS */, "embedded=hello");
     if (setPort) ces(h, CURLOPT_PORT, (long)9999);   // attempt a port-based bypass
     ces(h, CURLOPT_CONNECTTIMEOUT_MS, (long)3000);
     ces(h, CURLOPT_TIMEOUT_MS, (long)5000);
@@ -106,5 +122,5 @@ int main(int argc, char **argv) {
     printf("[host] curl_easy_perform rc=%d\n", (int)rc);
 
     if (cec) cec(h);
-    return 0;
+    return (int)rc;
 }

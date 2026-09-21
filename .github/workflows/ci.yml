@@ -46,6 +46,8 @@ jobs:
         run: |
           cl /nologo /O2 /MD /W3 windows\test\hooktest.c /Fe:windows\build\hooktest.exe /Fo:windows\build\hooktest.obj || exit /b 1
           windows\build\hooktest.exe || exit /b 1
+          cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS windows\test\winhttptest.c /Fe:windows\build\winhttptest.exe /Fo:windows\build\winhttptest.obj || exit /b 1
+          windows\build\winhttptest.exe || exit /b 1
 
       # Cross-bitness export resolver (PE32 only): the parser the 64-bit
       # fragment.exe runs over a WOW64 target's 32-bit kernel32 to find

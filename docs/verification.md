@@ -4,6 +4,12 @@ Windows x64, MSVC 19.44.35228, Bun 1.4.1 canary.
 
 ## Locally observed results
 
+- Pre-release rerun: 30/30 Windows curl/engine/state cases passed with the staged
+  curl-for-win 8.20 DLL and executable, including four embedded-curl POST cases
+  (already loaded, loaded later, bare, disabled). WinHTTP rerun: 19/19 passed;
+  Bun: 7 tests / 47 assertions passed; TypeScript type checking passed.
+- The earlier broader corpus run below is historical evidence, not a claim that
+  all those fixtures were included in this pre-release rerun.
 - WinHTTP: 19/19 integration cases passed. Real Windows WinHTTP, including POST
   payload preservation, disabled/bare controls, nonstandard origin ports, query
   strings, proxy settings, mount paths, session teardown, launch-and-inject, and

@@ -120,7 +120,9 @@ shared by both ports.
 **Finding libcurl** by **export** (`GetProcAddress`) for any shared libcurl
 (version-, compiler-, bitness-invariant), with a per-compiler-family
 prologue-signature scan as a fallback for statically-linked curl, gated on the
-module containing the symbol name. **Catching the module however it loads** by
+module containing the symbol name. This checks every module regardless of its
+filename, including embedded curl in DLLs with unrelated names, both already loaded
+and loaded later. **Catching the module however it loads** by
 layering `LdrRegisterDllNotification` (every mapped image, incl. transitive
 static imports), an `LdrLoadDll` chokepoint hook (LoadLibrary A/W/Ex +
 delay-load), and `LoadLibraryA`/`W` detours, plus an already-mapped sweep, with
@@ -242,7 +244,11 @@ Each suite proves behavior, not assertions: a **hook-engine unit test**
 (prologue relocation + fail-closed refusals), a self-contained **mock-libcurl
 integration test** (no third-party binaries, CI-runnable), and a **real-libcurl
 matrix**. Windows spans libcurl 7.30 → 8.20 and five compilers across the export
-and static-signature paths. Linux drives the system libcurl and `curl` binary
+and static-signature paths. When a compatible real-curl fixture is available,
+it also hides the hook exports in a DLL named `embedded-client.dll` and checks
+discovery before and after Fragment loads, with recorded POST traffic and bare
+and disabled controls. Missing or incompatible fixtures report SKIP.
+Linux drives the system libcurl and `curl` binary
 through interposition, the `curl_url` API, a transitive dependency, dlopen-then-
 `dlsym`, all four modes, runtime config, bypass neutralization with non-vacuous
 negative controls, a concurrency stress, a benchmark, the launcher, and a live

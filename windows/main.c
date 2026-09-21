@@ -245,15 +245,12 @@ static LPVOID FollowThunks(LPVOID p) {
 // module actually containing the symbol name so we never false-match.
 static LPVOID ResolveCurlFn(HMODULE module, PBYTE base, SIZE_T size, const char* name,
                             const CurlSig* sigs, size_t nsigs,
-                            BOOL allowSig, const char** how) {
+                            const char** how) {
     LPVOID target = (LPVOID) GetProcAddress(module, name);
     *how = "export";
-    // The signature scan walks the whole module image, so only attempt it for
-    // modules that plausibly ARE statically-linked curl (allowSig). Shared
-    // libcurl always resolves by export above regardless of name, so this
-    // never costs coverage for DLL curl -- it only avoids scanning every
-    // unrelated module the loader notification reports.
-    if (!target && allowSig && ModuleContainsAscii(base, size, name)) {
+    // Embedded curl can live in any module, regardless of its filename.
+    // Require the function-name marker before trying the signature fallback.
+    if (!target && ModuleContainsAscii(base, size, name)) {
         for (size_t i = 0; i < nsigs; ++i) {
             LPVOID candidate = FindPattern(base, size, sigs[i].pattern, sigs[i].mask);
             if (candidate && target && candidate != target) {
@@ -265,16 +262,6 @@ static LPVOID ResolveCurlFn(HMODULE module, PBYTE base, SIZE_T size, const char*
         *how = "signature";
     }
     return target ? FollowThunks(target) : NULL;
-}
-
-// Case-insensitive search for "curl" in a module's base name.
-static BOOL NameHasCurl(const char* s) {
-    for (; s && s[0] && s[1] && s[2] && s[3]; ++s) {
-        if ((s[0] == 'c' || s[0] == 'C') && (s[1] == 'u' || s[1] == 'U') &&
-            (s[2] == 'r' || s[2] == 'R') && (s[3] == 'l' || s[3] == 'L'))
-            return TRUE;
-    }
-    return FALSE;
 }
 
 // Serializes the resolve+dedup+install sequence so concurrent load
@@ -316,13 +303,6 @@ void HookCurl(HMODULE module) {
     for (const char* p = path; *p; ++p)
         if (*p == '\\' || *p == '/') moduleName = p + 1;
 
-    // Allow the (whole-image) static-curl signature scan only for modules that
-    // plausibly are curl: name contains "curl", or the main executable (apps
-    // that statically link libcurl). Shared libcurl resolves by export anyway,
-    // so this never costs coverage for DLL curl. Residual gap: statically
-    // linked curl inside a dynamically-loaded DLL whose name lacks "curl".
-    BOOL allowSig = NameHasCurl(moduleName) || (module == GetModuleHandleW(NULL));
-
     const char* how;
 
     if (gHookLockReady) EnterCriticalSection(&gHookLock);
@@ -330,7 +310,7 @@ void HookCurl(HMODULE module) {
     // --- curl_easy_setopt: rewrites CURLOPT_URL/CURLU; neutralizes the divert
     //     options (RESOLVE/CONNECT_TO/UNIX_SOCKET/PROXY/PRE_PROXY/PORT)
     LPVOID setopt = ResolveCurlFn(module, base, size, "curl_easy_setopt",
-                                  kSetoptSigs, kSetoptSigCount, allowSig, &how);
+                                  kSetoptSigs, kSetoptSigCount, &how);
     if (setopt && !FrIsHooked(setopt)) {
         CurlSetoptCtx* ctx = (CurlSetoptCtx*) FrHeapAlloc(sizeof(CurlSetoptCtx));
         if (ctx) {
@@ -352,7 +332,7 @@ void HookCurl(HMODULE module) {
 
     // --- curl_url_set: covers URLs built/mutated via the curl_url API
     LPVOID urlset = ResolveCurlFn(module, base, size, "curl_url_set",
-                                  kUrlSetSigs, kUrlSetSigCount, allowSig, &how);
+                                  kUrlSetSigs, kUrlSetSigCount, &how);
     if (urlset && !FrIsHooked(urlset)) {
         CurlUrlSetCtx* ctx = (CurlUrlSetCtx*) FrHeapAlloc(sizeof(CurlUrlSetCtx));
         if (ctx) {
