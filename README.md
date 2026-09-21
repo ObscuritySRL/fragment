@@ -1,7 +1,7 @@
 # Fragment
 
 **Fragment** transparently redirects a target process's
-[libcurl](https://curl.se/libcurl/) traffic through a local reverse-proxy. It
+[libcurl](https://curl.se/libcurl/) and Windows WinHTTP traffic through a local reverse-proxy. It
 intercepts libcurl at its **API layer** and rewrites every outbound request URL
 to
 
@@ -74,7 +74,7 @@ cd linux && ./build.sh
 Or build the host platform from the repository root with the single CMake entry:
 `cmake -S . -B build && cmake --build build`.
 
-You provide the proxy listening on `127.0.0.1:9020`. It receives requests whose
+Start the included Bun proxy with `bun tools/proxy.ts` (or `bun tools/proxy.ts 19020` for an alternate port), or provide your own proxy on `127.0.0.1:9020`. It receives requests whose
 path is the full original URL (e.g. `GET /https://api.example.com/health`) and
 is expected to forward them upstream and relay the response. `fragment --help`
 lists every option.
@@ -112,7 +112,7 @@ inline-hook engine — no third-party dependency. The engine length-decodes the
 target prologue, relocates it into a trampoline within reach, and patches a
 jump; the decoder **fails closed** (anything it cannot relocate with certainty
 is refused, leaving the target untouched). The x86-64 prologue decoder is the
-OS-independent part and lives once in [`common/decode_x86_64.h`](common/decode_x86_64.h),
+OS-independent part and lives once in [`common/arch/x86_64/decode.h`](common/arch/x86_64/decode.h),
 shared by both ports.
 
 ### Windows
@@ -120,13 +120,15 @@ shared by both ports.
 **Finding libcurl** by **export** (`GetProcAddress`) for any shared libcurl
 (version-, compiler-, bitness-invariant), with a per-compiler-family
 prologue-signature scan as a fallback for statically-linked curl, gated on the
-module containing the symbol name. **Catching the module however it loads** by
+module containing the symbol name. This checks every module regardless of its
+filename, including embedded curl in DLLs with unrelated names, both already loaded
+and loaded later. **Catching the module however it loads** by
 layering `LdrRegisterDllNotification` (every mapped image, incl. transitive
 static imports), an `LdrLoadDll` chokepoint hook (LoadLibrary A/W/Ex +
 delay-load), and `LoadLibraryA`/`W` detours, plus an already-mapped sweep, with
 a dedup keyed on the resolved address. The engine relocates into a trampoline
 within ±2 GB and patches a 5-byte jump. **Delivery** is `CreateRemoteThread` +
-`LoadLibrary` (`fragment.exe`); 32-bit (WOW64) targets are refused.
+`LoadLibrary` (`fragment.exe`); WOW64 targets use a separately built `Fragment32.dll`. Windows ARM64 has a native engine backend.
 
 ### Linux
 
@@ -167,16 +169,86 @@ self-contained engine unit test and the mock-libcurl integration on every push.
 
 ## Testing
 
+New orchestration uses TypeScript directly in Bun, with Bun's process, file and
+HTTP server APIs. The Python scripts remain as legacy references; the `.ts`
+counterparts do not invoke Python. Tests use ports **19020, 19021 and 19999** so
+they do not interfere with a development proxy on 9020. Missing optional corpora
+are reported as SKIP. Core fixtures and WinHTTP are self-contained.
+
 ```sh
-python3 windows/test/run.py        # Windows matrix (needs the third-party corpus)
-python3 linux/test/run.py          # Linux matrix   (uses the system libcurl + curl)
+bun windows/test/run.ts           # Windows curl matrix; optional third-party corpus
+bun windows/test/run_winhttp.ts   # Windows WinHTTP; no third-party corpus
+bun linux/test/run.ts             # Linux matrix; system libcurl + curl
+bun install --frozen-lockfile
+bun run typecheck
+bun test ./test
 ```
+
+Use `--no-build` to reuse native fixtures. Windows accepts explicit
+`--libcurl <path-to-dll>` and `--curl <path-to-exe>` arguments (repeatable),
+and prints the actual binaries exercised. For example:
+
+```powershell
+bun windows/test/run.ts --libcurl "C:\Program Files\Git\mingw64\bin\libcurl-4.dll"
+bun windows/test/pe.ts path/to/libcurl.dll curl_easy_setopt curl_url_set
+bun windows/test/verify_sigs.ts path/to/libcurl.dll
+```
+
+Linux has corresponding `elf.ts`, `sigcheck.ts` and `verify_sigs.ts` tools;
+signature checks take explicit binary paths and report missing symbols separately
+from unmatched signatures. A signature miss does not imply an export-hook miss.
+The Linux runner never changes the system's ptrace policy. Restricted attachment
+and unavailable cross-architecture toolchains are reported as SKIP. The legacy
+Python runners retain their informational benchmarks; the Bun runners focus on
+behavioral assertions.
+
+### Windows WinHTTP
+
+The backend redirects `WinHttpConnect` and rebuilds the original URL at
+`WinHttpOpenRequest`. It preserves the method/body, origin port and proxy mount
+path, tracks connection/session lifetimes, and neutralizes the application's
+own proxy settings. It activates only when all five required hooks install.
+The default HTTP proxy receives plain HTTP even for an HTTPS origin; an HTTPS
+proxy base uses TLS to the proxy. Connections opened before attachment cannot
+be reconstructed. WinINet, Schannel and Chromium/CEF are roadmap items, not
+implemented backends.
+
+### Diagnosing an empty proxy
+
+There are three separate milestones: **DLL loaded**, **backend hooks installed**,
+and **a request observed at the proxy**. The Windows launcher verifies the module
+list and explicitly reports only the first. A nonzero remote-thread result alone
+is not sufficient evidence: it may be an exception code.
+
+For a fresh process, enable diagnostics at launch:
+
+```powershell
+bun tools/proxy.ts 19020
+# In another terminal:
+windows/build/fragment.exe --proxy http://127.0.0.1:19020 --log debug --log-file fragment.log -- path/to/program.exe
+```
+
+Inspect the log for `[hook]` installation and `[winhttp] backend ready`, then
+confirm a real request in the proxy. `--pid` reads configuration from the
+already-running target's environment; launcher configuration flags cannot
+change that environment. Child processes are not automatically injected.
+Epic's CEF helpers and other Chromium networking processes may use an unsupported
+stack in another PID. Loading Fragment into the launcher does not establish
+coverage of those requests. Protected or otherwise non-injectable targets may
+reject DLL loading; a failure is not a successful capture.
+
+See [verification notes](docs/verification.md) for the tested binaries and
+observed boundaries from the Bun migration.
 
 Each suite proves behavior, not assertions: a **hook-engine unit test**
 (prologue relocation + fail-closed refusals), a self-contained **mock-libcurl
 integration test** (no third-party binaries, CI-runnable), and a **real-libcurl
 matrix**. Windows spans libcurl 7.30 → 8.20 and five compilers across the export
-and static-signature paths. Linux drives the system libcurl and `curl` binary
+and static-signature paths. When a compatible real-curl fixture is available,
+it also hides the hook exports in a DLL named `embedded-client.dll` and checks
+discovery before and after Fragment loads, with recorded POST traffic and bare
+and disabled controls. Missing or incompatible fixtures report SKIP.
+Linux drives the system libcurl and `curl` binary
 through interposition, the `curl_url` API, a transitive dependency, dlopen-then-
 `dlsym`, all four modes, runtime config, bypass neutralization with non-vacuous
 negative controls, a concurrency stress, a benchmark, the launcher, and a live
@@ -186,7 +258,7 @@ negative controls, a concurrency stress, a benchmark, the launcher, and a live
 
 ## Limitations (honest boundaries)
 
-- **x86-64 (both) / aarch64 (Linux) only** for the inline-hook layers. The
+- **Windows x86-64 / x86 / ARM64; Linux x86-64 / i386 / aarch64 / armv7** have inline-hook backends. The
   Linux symbol interposition itself is architecture-independent; the byte-patch
   engine, caller stubs, and static-curl signatures are not.
 - **API-layer interception is bypassable below it** — a custom

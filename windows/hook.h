@@ -285,6 +285,8 @@ static BOOL InstallHook(void* target, void* detour, void** outTramp) {
     h->savedLen = (size_t)copyLen;
     memcpy(h->saved, tgt, (size_t)copyLen);
 
+    /* Publish the original before another thread can enter the detour. */
+    InterlockedExchangePointer((PVOID volatile*)outTramp, tramp);
     int32_t r32 = (int32_t)jrel;
     if (atomicPatch) {
         uint64_t nv;
@@ -309,7 +311,7 @@ static BOOL InstallHook(void* target, void* detour, void** outTramp) {
     h->next = gFrHooks; gFrHooks = h;
     LeaveCriticalSection(&gFrLock);
 
-    *outTramp = tramp;
+
     LogDebug("[hook] installed @ %p copyLen=%d block=%p tramp=%p relay=%p\n",
              target, copyLen, (void*)block, (void*)tramp, (void*)relay);
     return TRUE;
@@ -416,6 +418,7 @@ static BOOL InstallHook(void* target, void* detour, void** outTramp) {
     h->savedLen = (size_t)copyLen;
     memcpy(h->saved, tgt, (size_t)copyLen);
 
+    InterlockedExchangePointer((PVOID volatile*)outTramp, tramp);
     tgt[0] = 0xE9;
     memcpy(tgt + 1, &jrel, 4);
     for (int b = 5; b < copyLen; b++) tgt[b] = 0x90;
@@ -429,7 +432,7 @@ static BOOL InstallHook(void* target, void* detour, void** outTramp) {
     h->next = gFrHooks; gFrHooks = h;
     LeaveCriticalSection(&gFrLock);
 
-    *outTramp = tramp;
+
     LogDebug("[hook] installed @ %p copyLen=%d block=%p tramp=%p relay=%p\n",
              target, copyLen, (void*)block, (void*)tramp, (void*)relay);
     return TRUE;
@@ -508,6 +511,7 @@ static BOOL InstallHook(void* target, void* detour, void** outTramp) {
     h->savedLen = 4;
     memcpy(h->saved, tgt, 4);
 
+    InterlockedExchangePointer((PVOID volatile*)outTramp, tramp);
     uint32_t patch = FrEncB((uintptr_t)tgt, (uintptr_t)relay);
     InterlockedExchange((volatile LONG*)tgt, (LONG)patch);   /* one atomic 4-byte store */
 
@@ -520,7 +524,7 @@ static BOOL InstallHook(void* target, void* detour, void** outTramp) {
     h->next = gFrHooks; gFrHooks = h;
     LeaveCriticalSection(&gFrLock);
 
-    *outTramp = tramp;
+
     LogDebug("[hook] installed @ %p insn=0x%08x block=%p tramp=%p relay=%p\n",
              target, first, (void*)block, (void*)tramp, (void*)relay);
     return TRUE;

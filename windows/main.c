@@ -75,6 +75,8 @@ CURLcode CurlSetoptDetourWithInstance(CurlSetoptCtx* ctx, LPVOID curl, CURLoptio
                 }
                 ctx->urlFree(cur);
             }
+        } else if (uh) {
+            LogWarn("[setopt] CURLOPT_CURLU cannot be rewritten: URL API exports unavailable\n");
         }
     } else if (option == CURLOPT_RESOLVE || option == CURLOPT_CONNECT_TO ||
                option == CURLOPT_UNIX_SOCKET_PATH ||
@@ -148,13 +150,14 @@ static const CurlSig kSetoptSigs[] = {
     // spill r8/r9; mov rax,[rbx]; xor eax,eax; test rcx,rcx.
     { "\x53\x48\x83\xEC\x00\x48\x8B\x1D\x00\x00\x00\x00\x4C\x89\x44\x24\x00\x4C\x89\x4C\x24\x00\x48\x8B\x03\x48\x89\x44\x24\x00\x31\xC0\x48\x85\xC9",
       "xxxx?xxx????xxxx?xxxx?xxxxxxx?xxxxx" },
-    // Clang/LLVM (curl-for-win), with CET endbr64; mov eax,0x2b
-    // (CURLE_BAD_FUNCTION_ARGUMENT); test rcx,rcx.
-    { "\xF3\x0F\x1E\xFA\x55\x56\x57\x48\x83\xEC\x00\x48\x8D\x6C\x24\x00\x4C\x89\x45\x00\x4C\x89\x4D\x00\xB8\x2B\x00\x00\x00\x48\x85\xC9",
-      "xxxxxxxxxx?xxxx?xxx?xxx?xxxxxxxx" },
-    // Same as above without endbr64 (CET-disabled clang builds).
-    { "\x55\x56\x57\x48\x83\xEC\x00\x48\x8D\x6C\x24\x00\x4C\x89\x45\x00\x4C\x89\x4D\x00\xB8\x2B\x00\x00\x00\x48\x85\xC9",
-      "xxxxxx?xxxx?xxx?xxx?xxxxxxxx" },
+    // curl-for-win 8.20.0_1. The old short clang prefix also matched
+    // curl_share_setopt in 8.22; retain the observed argument setup here.
+    { "\xF3\x0F\x1E\xFA\x55\x56\x57\x48\x83\xEC\x30\x48\x8D\x6C\x24\x30\x4C\x89\x45\x30\x4C\x89\x4D\x38\xB8\x2B\x00\x00\x00\x48\x85\xC9\x74\x2E\x89\xD6\x4C\x8D\x45\x30\x4C\x89\x45\xF8\x48\x89\xCF",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
+    // curl-for-win 8.22.0_1, clang 23: exact exported body also occurs once
+    // in the matching static curl.exe. Keep the symbol-name gate unchanged.
+    { "\xF3\x0F\x1E\xFA\x55\x56\x57\x53\x48\x83\xEC\x28\x48\x8D\x6C\x24\x20\x4C\x89\x45\x40\x4C\x89\x4D\x48\xB8\x2B\x00\x00\x00\x48\x85\xC9\x0F\x84\xA1\x00\x00\x00\x81\x39\xAD\xDB\xDE\xC0\x0F\x85\x95",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
 };
 #elif defined(_M_IX86) || defined(__i386__)
 // Best-effort 32-bit __cdecl frame prologues (MSVC hotpatch `mov edi,edi` + the
@@ -194,6 +197,9 @@ static const CurlSig kUrlSetSigs[] = {
     // sub rsp,imm32; lea rbp,[rsp+disp32]; test rcx,rcx; je.
     { "\xF3\x0F\x1E\xFA\x55\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x53\x48\x81\xEC\x00\x00\x00\x00\x48\x8D\xAC\x24\x00\x00\x00\x00\x48\x85\xC9\x74\x00\x4D\x89\xC6\x89\xD3\x48\x89\xCE\x4D\x85\xC0",
       "xxxxxxxxxxxxxxxxxxx????xxxx????xxxx?xxxxxxxxxxx" },
+    // curl-for-win 8.22.0_1, clang 23, smaller stack frame.
+    { "\xF3\x0F\x1E\xFA\x55\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x53\x48\x83\xEC\x78\x48\x8D\x6C\x24\x70\x48\x85\xC9\x74\x75\x4D\x89\xC4\x41\x89\xD5\x48\x89\xCE\x4D\x85\xC0\x74\x71\x45\x89\xCF\x4C",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
 };
 #elif defined(_M_IX86) || defined(__i386__)
 // curl_url_set frame prologues for a statically-linked x86 program (best-effort;
@@ -239,30 +245,23 @@ static LPVOID FollowThunks(LPVOID p) {
 // module actually containing the symbol name so we never false-match.
 static LPVOID ResolveCurlFn(HMODULE module, PBYTE base, SIZE_T size, const char* name,
                             const CurlSig* sigs, size_t nsigs,
-                            BOOL allowSig, const char** how) {
+                            const char** how) {
     LPVOID target = (LPVOID) GetProcAddress(module, name);
     *how = "export";
-    // The signature scan walks the whole module image, so only attempt it for
-    // modules that plausibly ARE statically-linked curl (allowSig). Shared
-    // libcurl always resolves by export above regardless of name, so this
-    // never costs coverage for DLL curl -- it only avoids scanning every
-    // unrelated module the loader notification reports.
-    if (!target && allowSig && ModuleContainsAscii(base, size, name)) {
-        for (size_t i = 0; i < nsigs && !target; ++i)
-            target = FindPattern(base, size, sigs[i].pattern, sigs[i].mask);
+    // Embedded curl can live in any module, regardless of its filename.
+    // Require the function-name marker before trying the signature fallback.
+    if (!target && ModuleContainsAscii(base, size, name)) {
+        for (size_t i = 0; i < nsigs; ++i) {
+            LPVOID candidate = FindPattern(base, size, sigs[i].pattern, sigs[i].mask);
+            if (candidate && target && candidate != target) {
+                LogWarn("[hook] ambiguous signatures for %s; leaving unhooked\n", name);
+                return NULL;
+            }
+            if (candidate) target = candidate;
+        }
         *how = "signature";
     }
     return target ? FollowThunks(target) : NULL;
-}
-
-// Case-insensitive search for "curl" in a module's base name.
-static BOOL NameHasCurl(const char* s) {
-    for (; s && s[0] && s[1] && s[2] && s[3]; ++s) {
-        if ((s[0] == 'c' || s[0] == 'C') && (s[1] == 'u' || s[1] == 'U') &&
-            (s[2] == 'r' || s[2] == 'R') && (s[3] == 'l' || s[3] == 'L'))
-            return TRUE;
-    }
-    return FALSE;
 }
 
 // Serializes the resolve+dedup+install sequence so concurrent load
@@ -283,6 +282,11 @@ static void HookLockInit(void) {
     }
 }
 
+// The WinHTTP backend reuses gHookLock / gHookLockReady (defined just above) to
+// serialize its resolve+dedup+install against the curl backend's shared hook
+// registry, so it is included here rather than at the top of the file.
+#include "winhttp.h"
+
 void HookCurl(HMODULE module) {
     if (!module) return;
 
@@ -299,13 +303,6 @@ void HookCurl(HMODULE module) {
     for (const char* p = path; *p; ++p)
         if (*p == '\\' || *p == '/') moduleName = p + 1;
 
-    // Allow the (whole-image) static-curl signature scan only for modules that
-    // plausibly are curl: name contains "curl", or the main executable (apps
-    // that statically link libcurl). Shared libcurl resolves by export anyway,
-    // so this never costs coverage for DLL curl. Residual gap: statically
-    // linked curl inside a dynamically-loaded DLL whose name lacks "curl".
-    BOOL allowSig = NameHasCurl(moduleName) || (module == GetModuleHandleW(NULL));
-
     const char* how;
 
     if (gHookLockReady) EnterCriticalSection(&gHookLock);
@@ -313,7 +310,7 @@ void HookCurl(HMODULE module) {
     // --- curl_easy_setopt: rewrites CURLOPT_URL/CURLU; neutralizes the divert
     //     options (RESOLVE/CONNECT_TO/UNIX_SOCKET/PROXY/PRE_PROXY/PORT)
     LPVOID setopt = ResolveCurlFn(module, base, size, "curl_easy_setopt",
-                                  kSetoptSigs, kSetoptSigCount, allowSig, &how);
+                                  kSetoptSigs, kSetoptSigCount, &how);
     if (setopt && !FrIsHooked(setopt)) {
         CurlSetoptCtx* ctx = (CurlSetoptCtx*) FrHeapAlloc(sizeof(CurlSetoptCtx));
         if (ctx) {
@@ -335,7 +332,7 @@ void HookCurl(HMODULE module) {
 
     // --- curl_url_set: covers URLs built/mutated via the curl_url API
     LPVOID urlset = ResolveCurlFn(module, base, size, "curl_url_set",
-                                  kUrlSetSigs, kUrlSetSigCount, allowSig, &how);
+                                  kUrlSetSigs, kUrlSetSigCount, &how);
     if (urlset && !FrIsHooked(urlset)) {
         CurlUrlSetCtx* ctx = (CurlUrlSetCtx*) FrHeapAlloc(sizeof(CurlUrlSetCtx));
         if (ctx) {
@@ -351,6 +348,14 @@ void HookCurl(HMODULE module) {
     if (gHookLockReady) LeaveCriticalSection(&gHookLock);
 }
 
+// Run every per-module backend over a freshly observed module. New backends
+// (WinHTTP today; WinINet / Schannel / ... next) hang off this single fan-out,
+// which every module-load path below and the already-mapped sweep invoke.
+static void HookModule(HMODULE module) {
+    HookCurl(module);
+    HookWinHttp(module);
+}
+
 typedef HMODULE(*LoadLibraryAFn)(LPCSTR lpLibFileName);
 LoadLibraryAFn LoadLibraryAOriginal = 0;
 
@@ -363,7 +368,7 @@ HMODULE LoadLibraryADetour(LPCSTR lpLibFileName) {
         LogDebug("[LoadLibraryA] loaded %s\n", nm);
     }
 
-    HookCurl(result);
+    HookModule(result);
 
     return result;
 }
@@ -380,7 +385,7 @@ HMODULE LoadLibraryWDetour(LPCWSTR lpLibFileName) {
         LogDebug("[LoadLibraryW] loaded %s\n", nm);
     }
 
-    HookCurl(result);
+    HookModule(result);
 
     return result;
 }
@@ -411,7 +416,7 @@ static VOID CALLBACK DllLoadNotification(ULONG reason,
                                          PVOID context) {
     (void) context;
     if (reason == FR_LDR_DLL_NOTIFICATION_REASON_LOADED && data && data->DllBase)
-        HookCurl((HMODULE) data->DllBase);
+        HookModule((HMODULE) data->DllBase);
 }
 
 static BOOL RegisterLoaderNotification(void) {
@@ -443,7 +448,7 @@ static LONG NTAPI LdrLoadDllDetour(PWSTR path, PULONG flags, PVOID name, PVOID* 
     LONG status = LdrLoadDllOriginal(path, flags, name, handle);
     // NTSTATUS >= 0 is success/informational; *handle is the loaded module.
     if (status >= 0 && handle && *handle)
-        HookCurl((HMODULE) *handle);
+        HookModule((HMODULE) *handle);
     return status;
 }
 
@@ -555,7 +560,7 @@ BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID lpvReserved) {
             DWORD count = cbNeeded / sizeof(HMODULE);
             for (DWORD i = 0; i < count; i++) {
                 if (mods[i] == hinstDLL) continue;   // skip ourselves
-                HookCurl(mods[i]);
+                HookModule(mods[i]);
             }
         }
         FrHeapFree(mods);

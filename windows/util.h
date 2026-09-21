@@ -66,6 +66,7 @@ inline LPVOID FindPattern(PBYTE base, SIZE_T imageSize, LPCSTR lpPattern, LPCSTR
     size_t patternLength = strlen(lpMask);
     if (patternLength == 0) return 0;
 
+    PBYTE found = NULL;
     PBYTE region = base;
     MEMORY_BASIC_INFORMATION mbi;
     while (region < imageEnd && VirtualQuery(region, &mbi, sizeof(mbi)) == sizeof(mbi)) {
@@ -76,8 +77,10 @@ inline LPVOID FindPattern(PBYTE base, SIZE_T imageSize, LPCSTR lpPattern, LPCSTR
         if (IsExecRegion(&mbi) && (size_t)(regionEnd - regionBase) >= patternLength) {
             PBYTE scanEnd = regionEnd - patternLength;
             for (PBYTE p = regionBase; p <= scanEnd; ++p) {
-                if (MaskCompare(p, lpPattern, lpMask))
-                    return p;
+                if (MaskCompare(p, lpPattern, lpMask)) {
+                    if (found) return NULL; /* ambiguous: never choose the first */
+                    found = p;
+                }
             }
         }
 
@@ -85,7 +88,7 @@ inline LPVOID FindPattern(PBYTE base, SIZE_T imageSize, LPCSTR lpPattern, LPCSTR
         if (mbi.RegionSize == 0) break;
     }
 
-    return 0;
+    return found;
 }
 
 // Does the module's image contain this ASCII string anywhere in a

@@ -11,6 +11,7 @@
  * request lands on the proxy port with the rewritten path.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <windows.h>
 #include <string.h>
 
@@ -82,7 +83,8 @@ int main(int argc, char **argv) {
         _snprintf(path, sizeof(path), "/%s", marker);
         cus(uh, CURLUPART_SCHEME, "http", 0);
         cus(uh, CURLUPART_HOST, "127.0.0.1", 0);
-        cus(uh, CURLUPART_PORT, "9999", 0);
+        const char* testPort = getenv("FRAGMENT_TEST_ORIGIN_PORT");
+        cus(uh, CURLUPART_PORT, testPort ? testPort : "9999", 0);
         cus(uh, CURLUPART_PATH, path, 0);
     } else {
         cus(uh, CURLUPART_URL, url, 0);

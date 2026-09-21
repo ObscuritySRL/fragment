@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": ["bun"],
+    "skipLibCheck": true
+  },
+  "include": ["test/**/*.ts", "windows/test/*.ts", "linux/test/*.ts", "tools/**/*.ts"]
+}

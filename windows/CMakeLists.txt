@@ -6,7 +6,7 @@ set(CMAKE_C_STANDARD 17)
 # The injected DLL. NOTE: do not add another target whose name differs from
 # "Fragment" only by case (e.g. "fragment") -- on case-insensitive Windows the
 # Visual Studio generator collides their project files and builds only one.
-add_library(Fragment MODULE main.c curl.h util.h log.h config.h hook.h)
+add_library(Fragment MODULE main.c curl.h util.h log.h config.h hook.h winhttp.h)
 
 # End-user loader/injector, shipped alongside the DLL in releases.
 # The CMake TARGET name must differ from the DLL target "Fragment" by more than

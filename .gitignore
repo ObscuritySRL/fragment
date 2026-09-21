@@ -2,6 +2,7 @@
 build/
 build_ci/
 build_log.txt
+node_modules/
 *.o
 *.obj
 *.so

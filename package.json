@@ -1,0 +1,16 @@
+{
+  "name": "fragment-dev",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test ./test",
+    "test:windows": "bun windows/test/run.ts",
+    "test:winhttp": "bun windows/test/run_winhttp.ts",
+    "test:linux": "bun linux/test/run.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}
