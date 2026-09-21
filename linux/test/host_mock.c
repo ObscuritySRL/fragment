@@ -16,6 +16,7 @@
  */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -34,6 +35,7 @@ extern void*       mock_last_proxy(void);
 extern void*       mock_last_unix(void);
 extern void*       mock_last_abstract(void);
 extern long        mock_last_port(void);
+extern int64_t mock_last_offset(void);
 
 static int fails = 0;
 #define CHECK(cond, ...) do { if (cond) { printf("  ok:   " __VA_ARGS__); } \
@@ -73,6 +75,12 @@ int main(void) {
     /* 6. CURLOPT_PORT dropped (mock must receive 0) */
     curl_easy_setopt(h, CURLOPT_PORT, (long)8443);
     CHECK(mock_last_port() == 0, "CURLOPT_PORT dropped (got %ld)", mock_last_port());
+
+    const int64_t offsets[] = { INT64_C(0x1234567887654321), INT64_C(-1), INT64_C(0x100000000) };
+    for (int i = 0; i < 3; ++i) {
+        curl_easy_setopt(h, 30116, offsets[i]);
+        CHECK(mock_last_offset() == offsets[i], "64-bit option round trip %d", i);
+    }
 
     printf(fails ? "\nMOCK INTEGRATION FAILED (%d)\n" : "\nMOCK INTEGRATION OK\n", fails);
     return fails ? 1 : 0;

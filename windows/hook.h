@@ -113,6 +113,20 @@ static BOOL FrIsHooked(void* target) {
     return found;
 }
 
+/* Loader unload notification: retire identities without writing back into an
+ * unloading image. Keep trampoline storage alive; another thread can still be
+ * returning through a detour. The OS reclaims it at process exit. */
+static void FrForgetModule(void* base, size_t size) {
+    if (!gFrReady) return;
+    EnterCriticalSection(&gFrLock);
+    for (FrHook* h = gFrHooks; h; h = h->next) {
+        uintptr_t address = (uintptr_t)h->target;
+        if (address >= (uintptr_t)base && address - (uintptr_t)base < size)
+            h->target = NULL;
+    }
+    LeaveCriticalSection(&gFrLock);
+}
+
 /* Reserve+commit `size` bytes whose address is within +/-2 GB of `target`, so
  * a 5-byte relative jump from the target can reach it. Returns NULL if no slot
  * is free in range. */
@@ -546,7 +560,7 @@ static void HookEngineShutdown(void) {
     FrHook* h = gFrHooks;
     while (h) {
         DWORD old;
-        if (VirtualProtect(h->target, h->savedLen, PAGE_EXECUTE_READWRITE, &old)) {
+        if (h->target && VirtualProtect(h->target, h->savedLen, PAGE_EXECUTE_READWRITE, &old)) {
             memcpy(h->target, h->saved, h->savedLen);
             VirtualProtect(h->target, h->savedLen, old, &old);
             FlushInstructionCache(GetCurrentProcess(), h->target, h->savedLen);

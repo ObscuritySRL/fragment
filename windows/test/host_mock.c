@@ -17,6 +17,7 @@
  */
 #include <windows.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 #define CURLOPT_PORT              3
@@ -99,6 +100,27 @@ int main(int argc, char** argv) {
     /* 6. CURLOPT_PORT dropped (mock must receive 0) */
     setopt(h, CURLOPT_PORT, (long)8443);
     CHECK(lastPort() == 0, "CURLOPT_PORT dropped (got %ld)", lastPort());
+
+    int64_t (*lastOffset)(void) = (int64_t(*)(void))(void*)GetProcAddress(m, "mock_last_offset");
+    if (!lastOffset) return 5;
+    const int64_t offsets[] = { INT64_C(0x1234567887654321), INT64_C(-1), INT64_C(0x100000000) };
+    for (int i = 0; i < 3; ++i) {
+        setopt(h, 30116, offsets[i]);
+        CHECK(lastOffset() == offsets[i], "64-bit option round trip %d", i);
+    }
+    // Repeated unload/reload commonly reuses the same base address.
+    for (int i = 0; i < 8; ++i) {
+        FreeLibrary(m);
+        m = LoadLibraryA(argv[2]);
+        if (!m) return 4;
+        init = (init_t)(void*)GetProcAddress(m, "curl_easy_init");
+        setopt = (setopt_t)(void*)GetProcAddress(m, "curl_easy_setopt");
+        lastUrl = (lasturl_t)(void*)GetProcAddress(m, "mock_last_url");
+        if (!init || !setopt || !lastUrl) return 5;
+        setopt(init(), CURLOPT_URL, orig);
+        CHECK(strcmp(lastUrl(), expected) == 0, "reload %d still rewrites", i);
+    }
+    FreeLibrary(m);
 
     printf(fails ? "\nMOCK INTEGRATION FAILED (%d)\n" : "\nMOCK INTEGRATION OK\n", fails);
     return fails ? 1 : 0;

@@ -1,4 +1,5 @@
 import { Matrix, mustRun, run, environment, type Env } from '../../test/harness';
+import { redirectCases } from '../../test/redirects';
 
 if (process.platform !== 'linux') throw new Error('Linux tests require Linux');
 const root = `${import.meta.dir}/..`;
@@ -21,8 +22,13 @@ try {
   for (const exe of ['host_mock', 'host_mock_static']) await plain(exe, [`${b}/${exe}`], { LD_PRELOAD: lib });
   if (await Bun.file(`${b}/host`).exists()) {
     for (const mode of ['', 'dlopen', 'port']) await m.request(`curl ${mode || 'URL'}`, [`${b}/host`, url, mode], expected, config);
-    for (const mode of ['full', 'parts']) await m.request(`URL API ${mode}`,
+    for (const mode of ['full', 'parts', 'mutate', 'relative', 'reset', 'invalid', 'duplicate']) await m.request(`URL API ${mode}`,
       [`${b}/host_urlapi`, mode, url, 'curl'], expected, config);
+    for (const mode of ['interpose', 'hook', 'audit']) {
+      const loaderEnv: Env = mode === 'audit' ? { LD_AUDIT: lib } : { LD_PRELOAD: lib };
+      await m.request(`URL mutation loader=${mode}`, [`${b}/host_urlapi`, 'mutate', url, 'curl'], expected,
+        { FRAGMENT_PROXY: config.FRAGMENT_PROXY, FRAGMENT_TEST_ORIGIN_PORT: '19999', FRAGMENT_LOADER: mode, ...loaderEnv });
+    }
     await m.request('transitive curl', [`${b}/host_plugin`, `${b}/libplugin.so`, url], expected, config);
     for (const mode of ['auto', 'interpose', 'hook']) await m.request(`loader=${mode}`, [`${b}/host`, url],
       expected, { ...config, FRAGMENT_LOADER: mode });
@@ -33,6 +39,10 @@ try {
     await m.request('concurrency 8 x 60', [`${b}/host_stress`, url, '8', '60'], expected, config, 480);
     const curl = Bun.which('curl');
     if (curl) {
+      await redirectCases(m.check.bind(m), (url, proxy, disabled) => ({
+        cmd: [curl, '-fsSL', '--max-redirs', '8', '--max-time', '8', url],
+        env: { LD_PRELOAD: lib, FRAGMENT_PROXY: proxy, FRAGMENT_ENABLED: disabled ? '0' : '1' },
+      }));
       const base = [curl, '-sS', '-o', '/dev/null', '--max-time', '8'];
       for (const [name, args] of [
         ['connect-to', ['--connect-to', '::127.0.0.1:19999']],
@@ -79,4 +89,3 @@ try {
       [qemu, '-L', prefix, ...(exe === 'hooktest' ? [] : ['-E', `LD_PRELOAD=${b}/${arch}/libfragment.so`]), `${b}/${arch}/${exe}`]);
   }
 } finally { m.finish(); }
-

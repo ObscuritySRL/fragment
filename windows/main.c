@@ -24,6 +24,8 @@ static char* BuildProxiedUrl(const char* orig) {
     return out;
 }
 
+#include "../common/url_rewrite.h"
+
 // Per-hook context. `original` MUST be first: InstallHook writes the
 // trampoline into *ppOriginal (== &ctx->original) and GenerateCaller injects
 // &ctx as the detour's first argument, so &ctx->original == (void**)ctx. The
@@ -35,7 +37,7 @@ typedef struct {
     CurlFreeFn   urlFree;
 } CurlSetoptCtx;
 
-typedef struct { LPVOID original; } CurlUrlSetCtx;
+typedef struct { LPVOID original; CurlUrlGetFn urlGet; CurlFreeFn urlFree; } CurlUrlSetCtx;
 
 // curl_easy_setopt detour. Covers every way a program sets the
 // destination through the easy interface:
@@ -49,6 +51,15 @@ typedef struct { LPVOID original; } CurlUrlSetCtx;
 //   CURLOPT_PRE_PROXY    rewritten request off-box; "" also beats the env proxy)
 //   CURLOPT_PORT       - drop (a port override would change our :9020)
 CURLcode CurlSetoptDetourWithInstance(CurlSetoptCtx* ctx, LPVOID curl, CURLoption option, va_list param) {
+#if defined(_M_IX86) || defined(__i386__)
+    // The i386 stub supplies the original vararg address, not just its low word.
+    if (option >= 30000 && option < 40000) {
+        int64_t value;
+        memcpy(&value, param, sizeof(value));
+        return ((CurlSetoptFn)ctx->original)(curl, option, value);
+    }
+    memcpy(&param, param, sizeof(param));
+#endif
     char* newUrl = NULL;
 
     if (option == CURLOPT_URL) {
@@ -108,28 +119,11 @@ CURLcode CurlSetoptDetourWithInstance(CurlSetoptCtx* ctx, LPVOID curl, CURLoptio
     return result;
 }
 
-// curl_url_set detour: rewrite a full URL set through the URL-API so
-// programs that build a CURLU via curl_url_set(...CURLUPART_URL...) and
-// pass it with CURLOPT_CURLU are also redirected (including later
-// mutations). BuildProxiedUrl is idempotent so this never double-applies.
+// Apply full URLs, relative references, and component mutations to the origin
+// representation, then rebuild the proxy URL. No address-keyed CURLU cache.
 CURLUcode CurlUrlSetDetour(CurlUrlSetCtx* ctx, void* handle, CURLUPart what, const char* part, unsigned int flags) {
-    char* proxied = NULL;
-
-    if (what == CURLUPART_URL && part) {
-        proxied = BuildProxiedUrl(part);
-        if (proxied) {
-            LogDebug("[url_set] rewrite: %s\n", part);
-            part = proxied;
-        }
-    }
-
-    CURLUcode result = ((CurlUrlSetFn) ctx->original)(handle, what, part, flags);
-
-    if (proxied) {
-        free(proxied);
-    }
-
-    return result;
+    return FragmentUrlSet(handle, what, part, flags, (CurlUrlSetFn)ctx->original,
+                          ctx->urlGet, ctx->urlFree);
 }
 
 // Prologue signatures, one per compiler family, derived from real
@@ -336,6 +330,8 @@ void HookCurl(HMODULE module) {
     if (urlset && !FrIsHooked(urlset)) {
         CurlUrlSetCtx* ctx = (CurlUrlSetCtx*) FrHeapAlloc(sizeof(CurlUrlSetCtx));
         if (ctx) {
+            ctx->urlGet = (CurlUrlGetFn)(void*)GetProcAddress(module, "curl_url_get");
+            ctx->urlFree = (CurlFreeFn)(void*)GetProcAddress(module, "curl_free");
             LogInfo("[hook] curl_url_set via %s in %s @ 0x%p\n", how, moduleName, urlset);
             LPVOID stub = GenerateUrlSetCaller(ctx, &CurlUrlSetDetour);
             if (!stub || !CreateAndEnableHook(moduleName, urlset, stub, &ctx->original)) {
@@ -408,6 +404,7 @@ typedef VOID (CALLBACK *FR_LDR_NOTIFY_FN)(ULONG, const FR_LDR_NOTIFICATION_DATA*
 typedef LONG (NTAPI *FR_LdrRegisterFn)(ULONG, FR_LDR_NOTIFY_FN, PVOID, PVOID*);
 
 #define FR_LDR_DLL_NOTIFICATION_REASON_LOADED 1
+#define FR_LDR_DLL_NOTIFICATION_REASON_UNLOADED 2
 
 static PVOID gLdrCookie = NULL;
 
@@ -415,7 +412,14 @@ static VOID CALLBACK DllLoadNotification(ULONG reason,
                                          const FR_LDR_NOTIFICATION_DATA* data,
                                          PVOID context) {
     (void) context;
-    if (reason == FR_LDR_DLL_NOTIFICATION_REASON_LOADED && data && data->DllBase)
+    if (!data || !data->DllBase) return;
+    if (reason == FR_LDR_DLL_NOTIFICATION_REASON_UNLOADED) {
+        EnterCriticalSection(&gHookLock);
+        FrForgetModule(data->DllBase, data->SizeOfImage);
+        WhModuleUnloaded((HMODULE)data->DllBase);
+        LeaveCriticalSection(&gHookLock);
+    } else if (reason == FR_LDR_DLL_NOTIFICATION_REASON_LOADED &&
+               (gCfg.loaderMode == FRAG_LOADER_AUTO || gCfg.loaderMode == FRAG_LOADER_NOTIFY))
         HookModule((HMODULE) data->DllBase);
 }
 
@@ -523,8 +527,11 @@ BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID lpvReserved) {
     BOOL ldrHook = FALSE;   // 2) LdrLoadDll chokepoint: LoadLibrary A/W/Ex+delay
     BOOL llHook  = FALSE;   // 3) LoadLibraryA/W detours: legacy last resort
 
+    // Even forced loader modes need unload bookkeeping. Loaded-image discovery
+    // remains gated in the callback so those modes retain their coverage.
+    BOOL lifecycleNotify = RegisterLoaderNotification();
     if (mode == FRAG_LOADER_AUTO || mode == FRAG_LOADER_NOTIFY) {
-        notify = RegisterLoaderNotification();
+        notify = lifecycleNotify;
         if (notify) LogInfo("[Fragment] approach: loader notification (covers all load paths)\n");
         else        LogWarn("[Fragment] LdrRegisterDllNotification unavailable\n");
     }

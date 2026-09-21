@@ -13,6 +13,7 @@ set OUT=%~dp0..\build
 if not exist "%OUT%" mkdir "%OUT%"
 
 cl /nologo /O2 /MD /W3 "%~dp0host.c"        /Fe"%OUT%\host.exe"        /Fo"%OUT%\host.obj"        || exit /b 1
+cl /nologo /O2 /MD /W3 "%~dp0host_args.c" /Fe"%OUT%\host_args.exe" /Fo"%OUT%\host_args.obj" || exit /b 1
 cl /nologo /O2 /MD /W3 "%~dp0host_urlapi.c" /Fe"%OUT%\host_urlapi.exe" /Fo"%OUT%\host_urlapi.obj" || exit /b 1
 cl /nologo /O2 /MD /W3 "%~dp0inject.c"      /Fe"%OUT%\inject.exe"      /Fo"%OUT%\inject.obj"      || exit /b 1
 cl /nologo /O2 /MD /W3 "%~dp0hooktest.c"    /Fe"%OUT%\hooktest.exe"    /Fo"%OUT%\hooktest.obj"    || exit /b 1

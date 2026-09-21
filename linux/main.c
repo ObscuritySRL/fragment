@@ -28,6 +28,8 @@ static char* BuildProxiedUrl(const char* orig) {
     return out;
 }
 
+#include "../common/url_rewrite.h"
+
 // The shared rewrite core, used by BOTH the symbol-interposition path and the
 // inline-hook detour, so the two never diverge. Covers every way a program sets
 // the destination through the easy interface:
@@ -144,6 +146,13 @@ CURLcode curl_easy_setopt(void* curl, CURLoption option, ...) {
 
     va_list ap;
     va_start(ap, option);
+    if (option >= 30000 && option < 40000) {
+        int64_t value = va_arg(ap, int64_t);
+        va_end(ap);
+        if (!gRealSetopt) return (CURLcode)-1;
+        void* tramp = FrTrampolineFor((void*)gRealSetopt);
+        return ((CurlSetoptFn)(tramp ? tramp : (void*)gRealSetopt))(curl, option, value);
+    }
     void* arg = va_arg(ap, void*);       /* the single GP-word option value */
     va_end(ap);
 
@@ -182,16 +191,10 @@ CURLUcode curl_url_set(void* handle, CURLUPart what, const char* part, unsigned 
     if (!gRewrite)
         return real(handle, what, part, flags);
 
-    char* proxied = NULL;
-    if (what == CURLUPART_URL && part) {
-        proxied = BuildProxiedUrl(part);
-        if (proxied) { LogDebug("[url_set] rewrite: %s\n", part); part = proxied; }
-    }
-    void* tramp = FrTrampolineFor((void*) real);
-    CurlUrlSetFn callee = tramp ? (CurlUrlSetFn) tramp : real;
-    CURLUcode rc = callee(handle, what, part, flags);
-    if (proxied) free(proxied);
-    return rc;
+    EnsureRealUrlApi();
+    void* tramp = FrTrampolineFor((void*)real);
+    return FragmentUrlSet(handle, what, part, flags,
+                          tramp ? (CurlUrlSetFn)tramp : real, gRealUrlGet, gRealUrlFree);
 }
 
 /* ======================================================================== */
@@ -209,9 +212,18 @@ typedef struct {
     CurlFreeFn   urlFree;
 } CurlSetoptCtx;
 
-typedef struct { void* original; } CurlUrlSetCtx;
+typedef struct { void* original; CurlUrlGetFn urlGet; CurlFreeFn urlFree; } CurlUrlSetCtx;
 
 CURLcode CurlSetoptDetourWithInstance(CurlSetoptCtx* ctx, void* curl, CURLoption option, void* arg) {
+#if defined(__i386__) || defined(__arm__)
+    // These stubs pass the address of both words of the original vararg.
+    if (option >= 30000 && option < 40000) {
+        int64_t value;
+        memcpy(&value, arg, sizeof(value));
+        return ((CurlSetoptFn)ctx->original)(curl, option, value);
+    }
+    memcpy(&arg, arg, sizeof(arg));
+#endif
     char* toFree = NULL;
     void* fwd = FragmentSetoptValue(curl, option, arg, ctx->urlGet, ctx->urlSet, ctx->urlFree, &toFree);
     CURLcode rc = ((CURLcode(*)(void*, CURLoption, ...)) ctx->original)(curl, option, fwd);
@@ -220,14 +232,8 @@ CURLcode CurlSetoptDetourWithInstance(CurlSetoptCtx* ctx, void* curl, CURLoption
 }
 
 CURLUcode CurlUrlSetDetour(CurlUrlSetCtx* ctx, void* handle, CURLUPart what, const char* part, unsigned int flags) {
-    char* proxied = NULL;
-    if (what == CURLUPART_URL && part) {
-        proxied = BuildProxiedUrl(part);
-        if (proxied) { LogDebug("[url_set] rewrite: %s\n", part); part = proxied; }
-    }
-    CURLUcode rc = ((CurlUrlSetFn) ctx->original)(handle, what, part, flags);
-    if (proxied) free(proxied);
-    return rc;
+    return FragmentUrlSet(handle, what, part, flags, (CurlUrlSetFn)ctx->original,
+                          ctx->urlGet, ctx->urlFree);
 }
 
 // Prologue signatures, one per compiler family, derived from real libcurl
@@ -339,6 +345,8 @@ static void HookCurlAt(void* setopt, void* urlSet, void* uget, void* uset, void*
     if (urlSet && !FrIsHooked(urlSet)) {
         CurlUrlSetCtx* ctx = (CurlUrlSetCtx*) FrHeapAlloc(sizeof(CurlUrlSetCtx));
         if (ctx) {
+            ctx->urlGet = (CurlUrlGetFn)uget;
+            ctx->urlFree = (CurlFreeFn)ufree;
             LogInfo("[hook] curl_url_set via %s @ %p\n", how, urlSet);
             void* stub = (void*) GenerateUrlSetCaller(ctx, (void*) &CurlUrlSetDetour);
             if (!stub || !CreateAndEnableHook("curl_url_set", urlSet, stub, &ctx->original))
@@ -480,9 +488,9 @@ static CurlFreeFn   gAuditRealFree   = NULL;
 // auditor lives in its own link-map namespace and cannot see the target's
 // libcurl through RTLD_NEXT/RTLD_DEFAULT.
 static void AuditEnsureUrlApi(void) {
-    if (gAuditRealUrlGet || !gAuditRealSetopt) return;
+    if (gAuditRealUrlGet || (!gAuditRealSetopt && !gAuditRealUrlSet)) return;
     Dl_info di;
-    if (dladdr((void*) gAuditRealSetopt, &di) && di.dli_fname && di.dli_fbase) {
+    if (dladdr(gAuditRealSetopt ? (void*)gAuditRealSetopt : (void*)gAuditRealUrlSet, &di) && di.dli_fname && di.dli_fbase) {
         uintptr_t bias = (uintptr_t) di.dli_fbase;
         gAuditRealUrlGet = (CurlUrlGetFn) ElfFindSym(di.dli_fname, bias, "curl_url_get");
         if (!gAuditRealUrlSet)
@@ -493,6 +501,11 @@ static void AuditEnsureUrlApi(void) {
 
 static CURLcode AuditSetopt(void* curl, CURLoption option, ...) {
     va_list ap; va_start(ap, option);
+    if (option >= 30000 && option < 40000) {
+        int64_t value = va_arg(ap, int64_t);
+        va_end(ap);
+        return gAuditRealSetopt(curl, option, value);
+    }
     void* arg = va_arg(ap, void*); va_end(ap);
     AuditEnsureUrlApi();
     char* toFree = NULL;
@@ -502,11 +515,9 @@ static CURLcode AuditSetopt(void* curl, CURLoption option, ...) {
     return rc;
 }
 static CURLUcode AuditUrlSet(void* handle, CURLUPart what, const char* part, unsigned int flags) {
-    char* proxied = NULL;
-    if (what == CURLUPART_URL && part) { proxied = BuildProxiedUrl(part); if (proxied) part = proxied; }
-    CURLUcode rc = gAuditRealUrlSet(handle, what, part, flags);
-    if (proxied) free(proxied);
-    return rc;
+    AuditEnsureUrlApi();
+    return FragmentUrlSet(handle, what, part, flags, gAuditRealUrlSet,
+                          gAuditRealUrlGet, gAuditRealFree);
 }
 
 __attribute__((visibility("default")))

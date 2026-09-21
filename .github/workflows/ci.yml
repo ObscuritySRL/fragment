@@ -69,6 +69,15 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         if: matrix.arch == 'x64'
 
+      - name: Launcher argument regression
+        if: matrix.arch == 'x64'
+        shell: cmd
+        env:
+          FRAGMENT_TEST_BUILD: ${{ github.workspace }}/windows/build/Release
+        run: |
+          cl /nologo /O2 /MD /W3 windows\test\host_args.c /Fe:windows\build\Release\host_args.exe /Fo:windows\build\host_args.obj || exit /b 1
+          bun test windows/test/launcher.test.ts || exit /b 1
+
       - name: WinHTTP end-to-end matrix (Bun)
         if: matrix.arch == 'x64'
         shell: cmd
@@ -185,6 +194,10 @@ jobs:
 
       - name: Install toolchain
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake libcurl4-openssl-dev
+
+      - name: Install 32-bit regression toolchains
+        if: runner.arch == 'X64'
+        run: sudo apt-get install -y --no-install-recommends gcc-i686-linux-gnu gcc-arm-linux-gnueabihf qemu-user
 
       - uses: oven-sh/setup-bun@v2
 

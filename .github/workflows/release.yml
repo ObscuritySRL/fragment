@@ -56,6 +56,12 @@ jobs:
           Copy-Item windows/build/Release/fragment.exe  $stage/
           Copy-Item README.md  $stage/
           Copy-Item LICENSE    $stage/
+          Copy-Item AGENTS.md  $stage/
+          New-Item -ItemType Directory -Path "$stage/tools" | Out-Null
+          Copy-Item tools/proxy.ts "$stage/tools/"
+          Copy-Item CHANGELOG.md, BRIEF.md $stage/
+          New-Item -ItemType Directory -Path "$stage/docs" | Out-Null
+          Copy-Item docs/regression-validation.md "$stage/docs/"
           Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
 
       - name: Upload package artifact
@@ -95,6 +101,12 @@ jobs:
           mkdir -p "$stage"
           cp linux/build/libfragment.so linux/build/fragment "$stage"/
           cp README.md LICENSE "$stage"/
+          cp AGENTS.md "$stage"/
+          mkdir -p "$stage/tools"
+          cp tools/proxy.ts "$stage/tools/"
+          cp CHANGELOG.md BRIEF.md "$stage/"
+          mkdir -p "$stage/docs"
+          cp docs/regression-validation.md "$stage/docs/"
           tar czf "$stage.tar.gz" -C "$stage" .
 
       - name: Upload package artifact

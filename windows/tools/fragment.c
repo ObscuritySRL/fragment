@@ -15,6 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <shellapi.h>
+#include "command_line.h"
+#pragma comment(lib, "shell32.lib")
 #include "../../common/version.h"
 #include "../wow64.h"
 
@@ -226,19 +229,22 @@ int main(int argc, char** argv) {
     if (off)     SetEnvironmentVariableA("FRAGMENT_ENABLED", "0");
 
     if (launchIdx >= 0) {
-        char cmd[8192];
-        cmd[0] = 0;
-        for (int j = launchIdx; j < argc; j++) {
-            if (j > launchIdx) strncat(cmd, " ", sizeof(cmd) - strlen(cmd) - 1);
-            int q = strchr(argv[j], ' ') != NULL;
-            if (q) strncat(cmd, "\"", sizeof(cmd) - strlen(cmd) - 1);
-            strncat(cmd, argv[j], sizeof(cmd) - strlen(cmd) - 1);
-            if (q) strncat(cmd, "\"", sizeof(cmd) - strlen(cmd) - 1);
+        int wideArgc = 0;
+        wchar_t** wideArgv = CommandLineToArgvW(GetCommandLineW(), &wideArgc);
+        wchar_t* cmd = wideArgv && wideArgc == argc
+            ? FragmentCommandLine(argc - launchIdx, wideArgv + launchIdx) : NULL;
+        if (wideArgv) LocalFree(wideArgv);
+        if (!cmd) {
+            fprintf(stderr, "[fragment] cannot construct target command line (allocation failure or length limit)\n");
+            return 4;
         }
-        STARTUPINFOA si = { sizeof(si) };
+        STARTUPINFOW si = { sizeof(si) };
         PROCESS_INFORMATION pi = { 0 };
-        if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
-            fprintf(stderr, "[fragment] CreateProcess failed %lu\n", GetLastError());
+        BOOL created = CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+        DWORD createError = GetLastError();
+        free(cmd);
+        if (!created) {
+            fprintf(stderr, "[fragment] CreateProcess failed %lu\n", createError);
             return 4;
         }
         int wow = !target_is_x64(pi.hProcess);

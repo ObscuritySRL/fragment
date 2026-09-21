@@ -26,6 +26,7 @@ static void* g_lastProxy    = (void*)~(uintptr_t)0;
 static void* g_lastUnix     = (void*)~(uintptr_t)0;
 static void* g_lastAbstract = (void*)~(uintptr_t)0;
 static long  g_lastPort = -1;
+static int64_t g_lastOffset;
 
 void* curl_easy_init(void) { return (void*)(uintptr_t)0x1234; }
 
@@ -45,6 +46,8 @@ int curl_easy_setopt(void* handle, int option, ...) {
         g_lastUnix = va_arg(ap, void*);
     } else if (option == CURLOPT_ABSTRACT_UNIX_SOCKET) {
         g_lastAbstract = va_arg(ap, void*);
+    } else if (option >= 30000 && option < 40000) {
+        g_lastOffset = va_arg(ap, int64_t);
     } else if (option == CURLOPT_PORT) {
         g_lastPort = va_arg(ap, long);
     }
@@ -61,3 +64,5 @@ void*       mock_last_proxy(void)    { return g_lastProxy; }
 void*       mock_last_unix(void)     { return g_lastUnix; }
 void*       mock_last_abstract(void) { return g_lastAbstract; }
 long        mock_last_port(void)     { return g_lastPort; }
+
+int64_t mock_last_offset(void) { return g_lastOffset; }

@@ -33,7 +33,7 @@ mkdir -p "$OUT"
 # -Wall but not -Wunused-function: the engine/logger are header-only, so a test
 # that uses a subset of the API legitimately leaves some statics unreferenced
 # (the Windows build's /W3 likewise does not flag these).
-W="-O2 -std=c17 -Wall -Wno-unused-function"
+W="-O2 -std=c17 -Wall -Wno-unused-function -Werror=implicit-function-declaration"
 
 echo "== build_test ($MODE) with $CC -> $OUT =="
 

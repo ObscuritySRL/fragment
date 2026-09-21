@@ -4,6 +4,24 @@ All notable changes to **Fragment** are documented in this file.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-21
+
+### Fixed
+- Reinstall Windows curl hooks after a DLL unload/reload, including when the loader reuses the same image address.
+- Preserve 64-bit curl option values on Windows x86 and Linux i386/ARMv7; use the correct `int` ABI for curl result codes.
+- Preserve proxy routing when parsed curl URLs are mutated, reset, duplicated, or updated with relative references.
+- Keep relative redirect chains through the bundled proxy for both curl and WinHTTP, including automatic redirects that do not revisit hooked APIs.
+- Preserve empty, quoted, Unicode, and long target arguments in the Windows launcher; reject oversized command lines instead of truncating them.
+
+### Added
+- Regression tests for DLL reloads, 64-bit options, URL mutations, redirect chains, and Windows argument forwarding. Linux x64 CI now runs i386 and ARMv7 engine/mock tests under QEMU.
+- Updated usage and verification guidance. Release packages now include the Bun forwarding proxy, agent usage guide, changelog, and regression validation notes.
+
+### Known limitations
+- Linux live PID attachment failed in the local WSL fixture with both this version and the unchanged v1.2.0 baseline; launch-time interception passed. See `docs/regression-validation.md` for validation scope.
+- Retired Windows hook trampolines remain allocated until process exit. Component-level URL rewriting requires the matching curl URL getter/free functions; setter-only builds retain whole-URL coverage.
+- Packages remain Windows x64 and Linux x64/ARM64. Fixture results do not establish third-party application compatibility.
+
 ## [1.2.0] - 2026-09-21
 
 ### Added

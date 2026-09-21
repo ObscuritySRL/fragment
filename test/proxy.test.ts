@@ -25,6 +25,20 @@ test('proxy rejects malformed targets and preserves redirect responses', async (
   try {
     const response = await forward(new Request(`http://localhost/${origin.url}`));
     expect(response.status).toBe(302);
-    expect(response.headers.get('location')).toBe('/next');
+    expect(response.headers.get('location')).toBe(`http://localhost/${new URL('/next', origin.url).href}`);
+  } finally { origin.stop(true); }
+});
+
+test('redirects resolve against the upstream path and authority', async () => {
+  let location = '';
+  const origin = Bun.serve({ hostname: '127.0.0.1', port: 0,
+    fetch: () => new Response(null, { status: 307, headers: { location } }) });
+  try {
+    const target = new URL('/dir/start?old=1', origin.url);
+    for (location of ['/next', '../next', '?page=2', '//example.test/next', 'https://example.test/next']) {
+      const response = await forward(new Request(`http://localhost/${target}`));
+      expect(response.status).toBe(307);
+      expect(response.headers.get('location')).toBe(`http://localhost/${new URL(location, target).href}`);
+    }
   } finally { origin.stop(true); }
 });

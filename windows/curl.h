@@ -2,9 +2,8 @@
 
 #include "../common/curl_abi.h"
 
-// curl_easy_setopt is variadic; the generated trampoline passes the first
-// vararg by value, so we receive it as a va_list-typed slot.
-typedef CURLcode(*CurlSetoptFn)(void*, CURLoption, va_list);
+// Keep the real ABI variadic: on 32-bit targets curl_off_t occupies two words.
+typedef CURLcode(*CurlSetoptFn)(void*, CURLoption, ...);
 
 // curl_url_set(CURLU *handle, CURLUPart what, const char *part, unsigned flags)
 typedef CURLUcode(*CurlUrlSetFn)(void*, CURLUPart, const char*, unsigned int);

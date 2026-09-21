@@ -1,192 +1,335 @@
 # Fragment
 
-**Fragment** transparently redirects a target process's
-[libcurl](https://curl.se/libcurl/) and Windows WinHTTP traffic through a local reverse-proxy. It
-intercepts libcurl at its **API layer** and rewrites every outbound request URL
-to
+**Redirect a process's libcurl or Windows WinHTTP requests through a proxy you control.**
 
+Fragment is a C17 library and launcher for Windows and Linux. It changes the
+request destination at the HTTP API boundary, before the connection to the
+original server, and sends the original URL to your proxy in the request path:
+
+```text
+Target requests:  https://api.example.com/health
+Proxy receives:  GET /https://api.example.com/health
+Proxy address:   http://127.0.0.1:9020  (configurable)
 ```
-http://127.0.0.1:9020/<original-url>
-```
 
-Because the rewrite happens at the `curl_easy_setopt` / `curl_url` boundary —
-**before** libcurl resolves, connects, or starts a TLS handshake — it steers the
-request to your proxy *without* fighting certificate pinning. From the pinned
-server's perspective there is no connection to pin against; libcurl simply makes
-a plain-HTTP request to `127.0.0.1:9020`, and your proxy does whatever it likes
-upstream (terminate TLS to the real host, inspect, rewrite, record, replay).
+Your proxy forwards the request upstream and returns the response. It can also
+inspect, modify, record, or replay traffic. Fragment supplies the redirection;
+what gets recorded depends on the proxy. For a redirected HTTPS request using
+an HTTP proxy base, the target makes no TLS connection to the original server.
+This does not guarantee compatibility with every application's pinning or
+response-validation logic.
 
-> Inspired by [Jaren8r/Fragment](https://github.com/Jaren8r/Fragment).
+[Releases](https://github.com/ObscuritySRL/fragment/releases) ·
+[Agent usage guide](AGENTS.md#help-someone-use-fragment) ·
+[Verification notes](docs/verification.md) · [Changelog](CHANGELOG.md)
 
-This is a single cross-platform project: one shared, OS-independent core, with
-the OS-specific code segregated per platform and one build entry point.
+Inspired by [Jaren8r/Fragment](https://github.com/Jaren8r/Fragment).
 
-| Path | Role |
+## What it supports
+
+| Request stack | Platform | How Fragment redirects it |
+|---|---|---|
+| libcurl | Windows, Linux | Rewrites `CURLOPT_URL` and curl URL API values; neutralizes options that would divert the request away from the proxy. |
+| WinHTTP | Windows | Redirects the connection handle, remembers its original destination, and reconstructs the URL when a request handle is created. |
+| WinINet, Chromium/CEF networking, direct TLS or socket APIs, QUIC | No implemented backend | Loading Fragment does not establish coverage for these requests. |
+
+Both implemented backends use the same proxy contract and configuration. On
+Windows, they are discovered automatically; you do not select a libcurl versus
+WinHTTP mode. The `--loader` option changes discovery/interception strategy,
+not the networking stack used by the application.
+
+WinHTTP and WinINet are separate Windows APIs; a WinHTTP hook does not cover a
+program using WinINet. Schannel and OpenSSL operate at the TLS layer and are not
+standalone Fragment backends. An application may use either underneath a
+supported HTTP API, but direct calls to those TLS libraries are not intercepted.
+
+Coverage is per process. A launcher and its networking helper may be different
+processes, and children are not automatically injected. macOS is documentation
+only. [BRIEF.md](BRIEF.md) describes possible future backends, not shipping support.
+
+## Get started
+
+### 1. Get the right build
+
+Download and extract a matching asset from
+[Releases](https://github.com/ObscuritySRL/fragment/releases), or follow
+[Building from source](#building-from-source). GitHub's source ZIP/tarball is a
+source checkout, not a compiled package.
+
+| Release package | Keep together |
 |---|---|
-| [`common/`](common) | The OS-independent core shared by both ports — the x86-64 prologue decoder and the curl-ABI option ids. |
-| [`windows/`](windows) | The Windows port — `Fragment.dll` + `fragment.exe`. DLL injection + an inline-hook engine over libcurl's exports. |
-| [`linux/`](linux) | The Linux port — `libfragment.so` + `fragment`. `LD_PRELOAD` symbol interposition (+ rtld-audit, `dlopen`, and an inline-hook engine), with `ptrace` injection. |
+| Windows x64 | `fragment.exe` and `Fragment.dll` |
+| Linux X64 | `fragment` and `libfragment.so` |
+| Linux ARM64 | `fragment` and `libfragment.so` |
 
-Both ports share the same `FRAGMENT_*` configuration, the same leveled
-Release-capable logger, the same idempotent rewrite + option-neutralization
-semantics, and the same "fail closed / honest boundaries" philosophy.
+Match the library to the target architecture. The Windows x64 archive does not
+include the separately built `Fragment32.dll` needed for a 32-bit WOW64 target.
+Other engine architectures exist in source; check release assets before assuming
+there is a package for them. Compiled releases do not require a compiler.
 
----
+### 2. Start a compatible proxy
 
-## Why the API layer
-
-Most "redirect a program's HTTPS somewhere else" tricks operate at the socket or
-DNS layer, where the request is already committed to a host and (for HTTPS)
-encrypted — so cert pinning defeats them. Fragment intercepts the *intent*: the
-URL the application hands to libcurl. It:
-
-- **Rewrites** `CURLOPT_URL` and URLs built through the `curl_url` API
-  (`curl_url_set`, and `CURLOPT_CURLU` handles) to the proxy prefix. The rewrite
-  is **idempotent**, so re-setting a URL — or the interplay between the
-  `setopt` and `curl_url_set` paths — never double-prefixes.
-- **Neutralizes options that would divert traffic back off the proxy**:
-  `CURLOPT_RESOLVE` and `CURLOPT_CONNECT_TO`, `CURLOPT_PORT`,
-  `CURLOPT_UNIX_SOCKET_PATH` / `CURLOPT_ABSTRACT_UNIX_SOCKET`, and
-  `CURLOPT_PROXY` / `CURLOPT_PRE_PROXY` (forced to a direct `""`). It also scrubs
-  `http_proxy` / `https_proxy` / `all_proxy` from the target's environment at
-  load so an app that never sets a proxy through the API can't inherit one.
-
-The "rewrite at the curl API before the connection" property is the whole point;
-everything else — interposition, the inline-hook engine, the way the module is
-delivered into the process — is just implementation.
-
----
-
-## Quick start
+From the repository or a package containing the script, run in one terminal:
 
 ```sh
-# Windows  (Visual Studio 2017+ with the C++ x64 toolset)
-cd windows && build.bat
-build\fragment.exe -- curl.exe https://api.example.com/health   # launch & inject
-build\fragment.exe --pid 1234                                   # inject into a PID
-
-# Linux  (any C compiler; cmake optional)
-cd linux && ./build.sh
-./build/fragment -- curl https://api.example.com/health         # launch & preload
-./build/fragment --pid 1234                                     # ptrace-inject into a PID
+bun tools/proxy.ts 19020
 ```
 
-Or build the host platform from the repository root with the single CMake entry:
-`cmake -S . -B build && cmake --build build`.
+Leave it running. This optional forwarding proxy requires Bun and no package
+installation. It listens on loopback and prints the request method, URL, and
+upstream response status. It does not record response bodies. URLs and any
+payloads you choose to record can contain sensitive data.
 
-Start the included Bun proxy with `bun tools/proxy.ts` (or `bun tools/proxy.ts 19020` for an alternate port), or provide your own proxy on `127.0.0.1:9020`. It receives requests whose
-path is the full original URL (e.g. `GET /https://api.example.com/health`) and
-is expected to forward them upstream and relay the response. `fragment --help`
-lists every option.
+Release v1.2.1 includes `tools/proxy.ts` and `AGENTS.md`. Existing
+v1.2.0 archives omit them: obtain the [v1.2.0 proxy script](https://github.com/ObscuritySRL/fragment/blob/v1.2.0/tools/proxy.ts)
+from the repository, or use your own compatible proxy.
 
----
+A compatible proxy accepts `/<original-url>` paths and relays responses. An
+ordinary CONNECT or SOCKS proxy cannot be substituted without an adapter. The
+included script serves this contract at `/`; a custom mount such as `/inspect`
+requires a proxy that understands that mount.
+
+The examples use port **19020**; Fragment defaults to **9020**. If the chosen
+port is occupied, use another free port in both the proxy and launch command.
+
+### 3. Launch your program
+
+Open a second terminal in the extracted package directory. Replace the example
+program and arguments with your target.
+
+**Windows — PowerShell:**
+
+```powershell
+.\fragment.exe --version
+.\fragment.exe --proxy http://127.0.0.1:19020 --log debug --log-file fragment.log -- "C:\Path\To\program.exe" arg1
+```
+
+**Linux:**
+
+```sh
+./fragment --version
+./fragment --proxy http://127.0.0.1:19020 --log debug --log-file fragment.log -- /path/to/program arg1
+```
+
+Everything after `--` belongs to the target. If it needs a particular working
+directory, run there and use an absolute path to Fragment. An absolute
+`--log-file` path also makes diagnostics easier to locate. `--help` lists the
+options for the installed version.
+
+For a source build, use `windows/build/fragment.exe` or `linux/build/fragment`
+instead. Visual Studio multi-configuration builds place Windows binaries under
+`windows/build/Release/` (or `Debug/`); use the actual output directory.
+
+### 4. Verify a request
+
+Trigger a known action in the target and distinguish three results:
+
+| Result | Evidence |
+|---|---|
+| Library loaded | Launcher confirmation or the target's module list. |
+| Hooks installed | `[hook]` diagnostics; WinHTTP also logs `[winhttp] backend ready`. |
+| Request redirected | The expected original URL appears at the proxy and the target receives the expected response. |
+
+A loaded DLL alone is not a successful capture. For a controlled local test,
+check the exact path, method, body, target exit status, and absence of direct
+origin hits. Compare a bare launch and a launch with `--off` before `--`.
+
+To stop using Fragment, restart the target normally. Stopping only the proxy
+leaves the instrumented process sending requests to an unavailable destination.
+
+## Attach to an existing process
+
+From the package directory, after identifying the correct PID:
+
+```powershell
+# Windows
+.\fragment.exe --pid 1234
+```
+
+```sh
+# Linux
+./fragment --pid 1234
+```
+
+**Configuration comes from the target's existing environment.** Supplying
+`--proxy` or logging options alongside `--pid` cannot change that environment.
+Prefer launching with Fragment when you need to choose configuration or capture
+requests from startup. Existing WinHTTP connections lack the origin metadata
+needed for rewriting and pass through.
+
+Attachment requires access to the target. Linux ptrace policy or target
+protections can prevent it. An injection failure is not capture success;
+changing `--loader` does not provide an alternative DLL injection mechanism.
+
+## WinHTTP backend
+
+WinHTTP builds a request across session, connection, and request handles, rather
+than accepting one complete URL. Fragment hooks five exports from `winhttp.dll`:
+
+| Entry point | Behavior while the backend is active |
+|---|---|
+| `WinHttpOpen` | Forces a direct session so the application's upstream proxy does not intercept the redirected connection. |
+| `WinHttpConnect` | Connects to the configured proxy and stores the original host/port against the returned handle. |
+| `WinHttpOpenRequest` | Rebuilds `/<scheme>://<host>[:port]/<path>` from the connection metadata and request flags. Sets the secure flag according to the proxy scheme. |
+| `WinHttpSetOption` | Neutralizes later `WINHTTP_OPTION_PROXY` overrides. Other options pass through. |
+| `WinHttpCloseHandle` | Removes connection metadata, including entries belonging to a closed session. |
+
+For example, an HTTPS POST to `api.example.com:8443/orders?id=7`, with a proxy
+base of `http://127.0.0.1:19020`, arrives as:
+
+```http
+POST /https://api.example.com:8443/orders?id=7
+```
+
+The request method and body are preserved. Origin ports, query strings, and a
+configured proxy mount are included in the reconstructed path. An HTTP proxy
+base receives plain HTTP even for HTTPS origins; an HTTPS proxy base uses TLS
+to the proxy and requires suitable certificates and a compatible proxy server.
+The supplied Bun proxy listens over HTTP.
+
+Fragment handles WinHTTP already loaded at injection and discovered later.
+Redirection activates only after all five hooks install; partial installation
+stays inactive. Failure to retain origin metadata or allocate the rewritten
+path returns an error instead of sending an incorrectly reconstructed request.
+
+The real-WinHTTP test matrix covers GET/POST, body preservation, query strings,
+nonstandard ports, application proxy overrides, mount paths, session teardown,
+launcher injection, disabled/bare controls, and 480 concurrent requests. Separate
+state tests exercise partial activation and allocation failures.
+
+Limits include connections created before activation, the simple proxy-address
+parser (use a hostname or IPv4 address rather than relying on IPv6 literal
+support), and unverified WebSocket/streaming behavior. Fragment does not hook
+Schannel or capture TLS plaintext as a general fallback. Fixture success does
+not establish compatibility with a particular third-party application.
+
+## libcurl backend
+
+Fragment rewrites `CURLOPT_URL`, `curl_url_set`, and `CURLOPT_CURLU` URLs before
+connection setup. Rewriting is idempotent, so an already-prefixed URL is not
+prefixed again. It neutralizes diversion through `RESOLVE`, `CONNECT_TO`, `PORT`,
+Unix-socket options, `PROXY`, and `PRE_PROXY`, and removes inherited HTTP proxy
+environment settings when enabled.
+
+On **Windows**, exported curl functions are the primary discovery route.
+Embedded/static curl uses compiler-specific signatures only when the module
+contains the relevant symbol-name marker. Module filenames need not contain
+"curl". Ambiguous matches and unsupported instruction relocation are refused.
+The default discovery strategy combines loader notifications, loader hooks, and
+an already-loaded module sweep. `CURLOPT_CURLU` read-back needs URL API exports
+in the same module.
+
+On **Linux**, symbol interposition is combined with inline hooking by default.
+Resolution uses ELF symbol tables, with signatures as a fallback for stripped
+binaries. The available strategies are `auto`, `interpose`, `audit`, and `hook`;
+`audit` requires startup configuration and cannot rebind function pointers that
+were already captured. Launching uses `LD_PRELOAD` or `LD_AUDIT`; PID attachment
+uses ptrace to load the library.
+
+Unknown static builds remain best-effort. Fully static processes, custom socket
+callbacks, and requests made through another networking library can fall outside
+coverage. x86/x64 installation into a busy process retains documented
+non-atomic patch limitations.
 
 ## Configuration
 
-All knobs are read **once at load time from the environment**, so the *same*
-shipped binary can be re-pointed, toggled, or made verbose with no recompile.
+Configuration is read once from the target's environment when Fragment loads.
+Launcher flags set it for a new child. Use `--loader auto` unless diagnosing a
+specific discovery problem.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `FRAGMENT_PROXY` | Full proxy base, e.g. `http://127.0.0.1:9020`. Wins if set. | — |
-| `FRAGMENT_PROXY_HOST` | Proxy host (when `FRAGMENT_PROXY` is unset). | `127.0.0.1` |
-| `FRAGMENT_PROXY_PORT` | Proxy port (when `FRAGMENT_PROXY` is unset). | `9020` |
-| `FRAGMENT_ENABLED` | `0`/`false`/`no`/`off` → load but do not rewrite. | `1` |
-| `FRAGMENT_DISABLE` | `1`/`true`/`yes`/`on` → load but do not rewrite (overrides `FRAGMENT_ENABLED`). | `0` |
-| `FRAGMENT_LOG_LEVEL` | `off`\|`error`\|`warn`\|`info`\|`debug`. | `off` (Release) |
-| `FRAGMENT_LOG_FILE` | Write diagnostics to a file; if unset, to the debugger (Windows) / stderr (Linux). | — |
-| `FRAGMENT_LOG_CONSOLE` | `1` → also surface logs on a console / stderr. | `0` |
-| `FRAGMENT_LOADER` | Interception strategy — Windows: `auto`\|`notify`\|`ldrloaddll`\|`loadlibrary`; Linux: `auto`\|`interpose`\|`audit`\|`hook`. | `auto` |
+| `FRAGMENT_PROXY` | Full proxy base; takes precedence over host/port variables. | Unset |
+| `FRAGMENT_PROXY_HOST` | Proxy host when no full base is supplied. | `127.0.0.1` |
+| `FRAGMENT_PROXY_PORT` | Proxy port when no full base is supplied. | `9020` |
+| `FRAGMENT_ENABLED` | `0`, `false`, `no`, or `off` disables interception. | `1` |
+| `FRAGMENT_DISABLE` | `1`, `true`, `yes`, or `on` disables interception, overriding `FRAGMENT_ENABLED`. | `0` |
+| `FRAGMENT_LOG_LEVEL` | `off`, `error`, `warn`, `info`, or `debug`. | Normally `off` in Release |
+| `FRAGMENT_LOG_FILE` | Diagnostic output path. Otherwise debugger output on Windows, stderr on Linux. | Unset |
+| `FRAGMENT_LOG_CONSOLE` | `1` also sends diagnostics to console/stderr. | `0` |
+| `FRAGMENT_LOADER` | Windows: `auto`, `notify`, `ldrloaddll`, `loadlibrary`. Linux: `auto`, `interpose`, `audit`, `hook`. | `auto` |
 
-A malformed `FRAGMENT_PROXY` (empty, scheme-less, or collapsing to `/`) is
-rejected with a warning and the default is used, so a typo can never silently
-disable rewriting. Diagnostics work in **Release**: when the level is `off` the
-hot path costs a single comparison.
+Use a well-formed HTTP(S) proxy base. Empty or scheme-less configuration can
+fall back to the default; configuration validation is not a proxy reachability
+check. Enable diagnostics and confirm the destination actually observed.
 
----
+## When the proxy stays empty
 
-## How interception works
+Check these in order:
 
-Both ports rewrite at the same curl-API boundary and ship their **own**
-inline-hook engine — no third-party dependency. The engine length-decodes the
-target prologue, relocates it into a trampoline within reach, and patches a
-jump; the decoder **fails closed** (anything it cannot relocate with certainty
-is refused, leaving the target untouched). The x86-64 prologue decoder is the
-OS-independent part and lives once in [`common/arch/x86_64/decode.h`](common/arch/x86_64/decode.h),
-shared by both ports.
+1. **Proxy:** Is it listening on the configured host/port and serving the
+   `/<original-url>` contract? A 502 from the included proxy means its upstream
+   request failed; inspect its error output.
+2. **Loading:** Did the correct library load into the intended PID? Check paths,
+   target architecture, permissions, and the launcher's result.
+3. **Hooks:** Inspect `fragment.log`. Release builds support diagnostic logging;
+   you do not need a Debug build. A missing/unsupported signature or failed
+   relocation leaves that target unhooked.
+4. **Request path:** Does that process use libcurl or WinHTTP? Did the action
+   issue a new request, or use a WinHTTP connection created before attachment?
+5. **Process tree:** Is a child/helper doing the networking? A Chromium/CEF
+   helper is not covered merely because its launcher loaded Fragment.
 
-### Windows
+Use the [verification notes](docs/verification.md) to distinguish tested fixture
+behavior from application observations. The [agent guide](AGENTS.md) walks
+through setup and diagnosis for both source and downloaded copies.
 
-**Finding libcurl** by **export** (`GetProcAddress`) for any shared libcurl
-(version-, compiler-, bitness-invariant), with a per-compiler-family
-prologue-signature scan as a fallback for statically-linked curl, gated on the
-module containing the symbol name. This checks every module regardless of its
-filename, including embedded curl in DLLs with unrelated names, both already loaded
-and loaded later. **Catching the module however it loads** by
-layering `LdrRegisterDllNotification` (every mapped image, incl. transitive
-static imports), an `LdrLoadDll` chokepoint hook (LoadLibrary A/W/Ex +
-delay-load), and `LoadLibraryA`/`W` detours, plus an already-mapped sweep, with
-a dedup keyed on the resolved address. The engine relocates into a trampoline
-within ±2 GB and patches a 5-byte jump. **Delivery** is `CreateRemoteThread` +
-`LoadLibrary` (`fragment.exe`); WOW64 targets use a separately built `Fragment32.dll`. Windows ARM64 has a native engine backend.
+## Building from source
 
-### Linux
+Run from the repository root.
 
-**Symbol interposition** is the portable primary: the preloaded `.so` exports
-`curl_easy_setopt` / `curl_url_set` and forwards through `dlsym(RTLD_NEXT)`,
-shadowing libcurl for a direct link, a transitive dependency, or a default-scope
-`dlopen`, on **x86-64 and aarch64**, with no machine code. `FRAGMENT_LOADER`
-selects/forces among `auto` (interposition + an inline byte-patch of the real
-libcurl, which also covers an injected process), `interpose`, `audit` (the
-loader's rtld-audit `la_symbind` rebind), and `hook`. The functions to patch are
-resolved by reading the owning object's `.dynsym` / `.symtab` (immune to
-interposition, correct even when injected), with a prologue-signature scan as a
-stripped-binary fallback. The aarch64 backend patches a single naturally-aligned
-4-byte word (atomic, BTI-correct). **Delivery** is `LD_PRELOAD` / `LD_AUDIT`
-launch, or `ptrace` injection that makes the target `dlopen` the library
-(`dlopen` located by `dladdr` and matched in the target by inode).
+**Windows:** Visual Studio 2017+ with C++ x64 tools and CMake (the bundled Visual
+Studio CMake/Ninja tools are detected when available).
 
----
-
-## Building
-
-```sh
-# Windows: auto-detects any VS 2017+ x64 toolset via vswhere -- no hardcoded paths.
-cd windows && build.bat            # Release   (build.bat Debug for chatty logging)
-
-# Linux: prefers CMake (Ninja if present), falls back to a direct cc build.
-cd linux && ./build.sh             # Release   (./build.sh Debug; or `make`)
-
-# Either platform, from the repo root:
-cmake -S . -B build && cmake --build build
+```powershell
+cmd /c windows\build.bat
+# Optional: cmd /c windows\build.bat Debug
 ```
 
-Continuous integration ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
-builds on clean `windows-latest` and `ubuntu-latest` runners and runs the
-self-contained engine unit test and the mock-libcurl integration on every push.
+**Linux:** a C compiler; CMake is used when available, otherwise a direct compiler
+build is supported.
 
----
+```sh
+bash linux/build.sh
+# Optional: bash linux/build.sh Debug
+```
+
+Both produce the launcher and library. A shared CMake entry is also available:
+
+```sh
+cmake -S . -B build
+cmake --build build --config Release
+```
+
+Engine backends exist for Windows x64/x86/ARM64 and Linux x64/i386/ARM64/armv7.
+CI runs Windows x64/x86, WOW64 injection, Windows ARM64, and Linux x64/ARM64;
+additional source architectures are not implied to have the same current CI
+or release-package coverage.
 
 ## Testing
 
-New orchestration uses TypeScript directly in Bun, with Bun's process, file and
-HTTP server APIs. The Python scripts remain as legacy references; the `.ts`
-counterparts do not invoke Python. Tests use ports **19020, 19021 and 19999** so
-they do not interfere with a development proxy on 9020. Missing optional corpora
-are reported as SKIP. Core fixtures and WinHTTP are self-contained.
+Native fixtures are C; new orchestration uses Bun. From a source checkout:
 
 ```sh
-bun windows/test/run.ts           # Windows curl matrix; optional third-party corpus
-bun windows/test/run_winhttp.ts   # Windows WinHTTP; no third-party corpus
-bun linux/test/run.ts             # Linux matrix; system libcurl + curl
 bun install --frozen-lockfile
 bun run typecheck
 bun test ./test
+
+# On Windows:
+bun windows/test/run.ts
+bun windows/test/run_winhttp.ts
+
+# On Linux:
+bun linux/test/run.ts
 ```
 
-Use `--no-build` to reuse native fixtures. Windows accepts explicit
-`--libcurl <path-to-dll>` and `--curl <path-to-exe>` arguments (repeatable),
-and prints the actual binaries exercised. For example:
+The platform runners build their native fixtures; `--no-build` reuses an
+existing build. Tests use **19020, 19021, and 19999**: stop a demo proxy you
+started on one of those ports before running them. Missing optional fixtures
+are reported as SKIP. The Windows engine, mock curl, and WinHTTP fixtures need
+no downloaded curl corpus; Linux integration uses system curl/libcurl.
+
+Windows accepts repeatable `--libcurl <dll>` and `--curl <exe>` arguments:
 
 ```powershell
 bun windows/test/run.ts --libcurl "C:\Program Files\Git\mingw64\bin\libcurl-4.dll"
@@ -194,108 +337,40 @@ bun windows/test/pe.ts path/to/libcurl.dll curl_easy_setopt curl_url_set
 bun windows/test/verify_sigs.ts path/to/libcurl.dll
 ```
 
-Linux has corresponding `elf.ts`, `sigcheck.ts` and `verify_sigs.ts` tools;
-signature checks take explicit binary paths and report missing symbols separately
-from unmatched signatures. A signature miss does not imply an export-hook miss.
-The Linux runner never changes the system's ptrace policy. Restricted attachment
-and unavailable cross-architecture toolchains are reported as SKIP. The legacy
-Python runners retain their informational benchmarks; the Bun runners focus on
-behavioral assertions.
+The Windows runner also accepts `FRAGMENT_TEST_BUILD` for isolated build output
+when using `--no-build`. Build `host_args.exe` from `windows/test/host_args.c`
+alongside the other fixtures; `bun test windows/test/launcher.test.ts` checks
+argument forwarding. When a curl DLL depends on sibling DLLs, put its directory
+on the test process's `PATH` so relocated embedded fixtures can load them too.
 
-### Windows WinHTTP
+Regression coverage includes Windows DLL unload/reload, 64-bit curl option
+values on 32-bit targets, parsed-URL mutations, and real curl/WinHTTP redirect
+chains with disabled controls. The forwarding proxy rewrites HTTP(S) redirect
+locations back through itself. See [regression validation](docs/regression-validation.md)
+for the tested platforms and remaining limitations.
 
-The backend redirects `WinHttpConnect` and rebuilds the original URL at
-`WinHttpOpenRequest`. It preserves the method/body, origin port and proxy mount
-path, tracks connection/session lifetimes, and neutralizes the application's
-own proxy settings. It activates only when all five required hooks install.
-The default HTTP proxy receives plain HTTP even for an HTTPS origin; an HTTPS
-proxy base uses TLS to the proxy. Connections opened before attachment cannot
-be reconstructed. WinINet, Schannel and Chromium/CEF are roadmap items, not
-implemented backends.
+Linux has corresponding `elf.ts`, `sigcheck.ts`, and `verify_sigs.ts` tools.
+A signature miss does not imply an export-hook miss. Recording-server matrices
+check destination, path, method, body, request count, and child exit status;
+negative controls establish that bare/disabled requests are not rewritten.
+Linux tests report restricted ptrace attachment and unavailable cross toolchains
+as SKIP and do not change system ptrace policy. Python scripts remain legacy
+references; the Bun runners do not invoke them.
 
-### Diagnosing an empty proxy
+## Repository layout
 
-There are three separate milestones: **DLL loaded**, **backend hooks installed**,
-and **a request observed at the proxy**. The Windows launcher verifies the module
-list and explicitly reports only the first. A nonzero remote-thread result alone
-is not sufficient evidence: it may be an exception code.
-
-For a fresh process, enable diagnostics at launch:
-
-```powershell
-bun tools/proxy.ts 19020
-# In another terminal:
-windows/build/fragment.exe --proxy http://127.0.0.1:19020 --log debug --log-file fragment.log -- path/to/program.exe
-```
-
-Inspect the log for `[hook]` installation and `[winhttp] backend ready`, then
-confirm a real request in the proxy. `--pid` reads configuration from the
-already-running target's environment; launcher configuration flags cannot
-change that environment. Child processes are not automatically injected.
-Epic's CEF helpers and other Chromium networking processes may use an unsupported
-stack in another PID. Loading Fragment into the launcher does not establish
-coverage of those requests. Protected or otherwise non-injectable targets may
-reject DLL loading; a failure is not a successful capture.
-
-See [verification notes](docs/verification.md) for the tested binaries and
-observed boundaries from the Bun migration.
-
-Each suite proves behavior, not assertions: a **hook-engine unit test**
-(prologue relocation + fail-closed refusals), a self-contained **mock-libcurl
-integration test** (no third-party binaries, CI-runnable), and a **real-libcurl
-matrix**. Windows spans libcurl 7.30 → 8.20 and five compilers across the export
-and static-signature paths. When a compatible real-curl fixture is available,
-it also hides the hook exports in a DLL named `embedded-client.dll` and checks
-discovery before and after Fragment loads, with recorded POST traffic and bare
-and disabled controls. Missing or incompatible fixtures report SKIP.
-Linux drives the system libcurl and `curl` binary
-through interposition, the `curl_url` API, a transitive dependency, dlopen-then-
-`dlsym`, all four modes, runtime config, bypass neutralization with non-vacuous
-negative controls, a concurrency stress, a benchmark, the launcher, and a live
-`ptrace --pid` injection — plus the x86-64 subset under `qemu-x86_64`.
-
----
-
-## Limitations (honest boundaries)
-
-- **Windows x86-64 / x86 / ARM64; Linux x86-64 / i386 / aarch64 / armv7** have inline-hook backends. The
-  Linux symbol interposition itself is architecture-independent; the byte-patch
-  engine, caller stubs, and static-curl signatures are not.
-- **API-layer interception is bypassable below it** — a custom
-  `CURLOPT_OPENSOCKETFUNCTION` / `CURLOPT_SOCKOPTFUNCTION`, or an app that opens
-  its own raw sockets, is invisible.
-- **Static-curl support is symbol-table-based, then best-effort.** A stripped
-  static curl falls to a prologue-signature scan that **fails closed** when the
-  symbol name is absent from loaded memory.
-- **Linux `audit` mode rebinds call sites, not captured addresses**, and needs
-  `LD_AUDIT` at startup (launch-only). The other modes do not share this.
-- **Injection needs the right privileges** (an injectable target, and on Linux
-  `CAP_SYS_PTRACE` / root / `ptrace_scope=0`); a manually-mapped or fully-static
-  target may not be reachable. Config for an injected target comes from *its*
-  environment.
-
-If total interception matters for your use case, treat these as the edges of the
-guarantee, not footnotes.
-
----
-
-## Layout
-
-```
-common/      shared, OS-independent core (x86-64 prologue decoder, curl-ABI ids)
-windows/     Windows port: DllMain hooks, PE resolution, the Win32 engine, loader, tests
-linux/       Linux port: interposers + rtld-audit + ELF resolution, the POSIX engine, loader, tests
-CMakeLists.txt   one entry point -> builds the host platform from common/ + windows|linux
-```
-
-Each port's directory carries its own platform build script and a `test/`
-suite; both pull the shared core in through a relative include.
-
----
+| Path | Purpose |
+|---|---|
+| `common/` | Shared instruction decoders, relocation helpers, curl ABI constants, and version. |
+| `windows/` | DLL, launcher, libcurl/WinHTTP backends, hook engine, and Windows fixtures. |
+| `linux/` | Shared library, launcher, interposition/audit/hook support, and Linux fixtures. |
+| `tools/proxy.ts` | Optional Bun forwarding proxy. |
+| `test/` | Shared Bun harness, binary/signature tools, and tooling tests. |
+| `docs/verification.md` | Observed validation results and boundaries. |
+| `AGENTS.md` | Practical usage flow and contributor instructions for agents. |
+| `BRIEF.md` | Multi-backend roadmap. |
 
 ## License
 
-See [LICENSE](LICENSE).
-
-Fragment is a traffic-redirection and inspection tool. Use it only on software
-and systems you are authorized to analyze.
+See [LICENSE](LICENSE). Use Fragment only on software and systems you are
+authorized to analyze.

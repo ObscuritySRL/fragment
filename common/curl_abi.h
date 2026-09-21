@@ -4,11 +4,11 @@
 // option ids and the scalar types. Shared by both ports -- these numbers are
 // part of libcurl's stable ABI and have never been renumbered, so they are
 // valid for every curl version. The function-pointer typedefs DO differ by
-// calling convention (a va_list slot on the Windows trampoline, a single
-// general-purpose word on the System V / AAPCS64 path) and live in each port's
+// calling convention (32-bit caller stubs preserve the entire vararg rather
+// than a single general-purpose word) and live in each port's
 // curl.h.
 
-typedef long CURLcode;
+typedef int  CURLcode;
 typedef int  CURLoption;
 typedef int  CURLUcode;
 typedef int  CURLUPart;

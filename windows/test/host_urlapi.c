@@ -34,6 +34,7 @@ typedef void* CURLU;
 typedef int   CURLcode;
 typedef int   CURLUcode;
 typedef CURLU    (*curl_url_t)(void);
+typedef CURLU    (*curl_url_dup_t)(CURLU);
 typedef CURLUcode(*curl_url_set_t)(CURLU, int, const char*, unsigned int);
 typedef void     (*curl_url_cleanup_t)(CURLU);
 typedef CURL     (*curl_easy_init_t)(void);
@@ -66,6 +67,7 @@ int main(int argc, char **argv) {
 
     curl_global_init_t  cgi = (curl_global_init_t) (void*)GetProcAddress(hc, "curl_global_init");
     curl_url_t          cu  = (curl_url_t)         (void*)GetProcAddress(hc, "curl_url");
+    curl_url_dup_t      cud = (curl_url_dup_t)     (void*)GetProcAddress(hc, "curl_url_dup");
     curl_url_set_t      cus = (curl_url_set_t)     (void*)GetProcAddress(hc, "curl_url_set");
     curl_url_cleanup_t  cuc = (curl_url_cleanup_t) (void*)GetProcAddress(hc, "curl_url_cleanup");
     curl_easy_init_t    cei = (curl_easy_init_t)   (void*)GetProcAddress(hc, "curl_easy_init");
@@ -90,8 +92,34 @@ int main(int argc, char **argv) {
         cus(uh, CURLUPART_URL, url, 0);
     }
 
+    if (strcmp(mode, "duplicate") == 0) {
+        if (!cud || !cuc) return 5;
+        CURLU copy = cud(uh);
+        if (!copy) return 6;
+        cuc(uh);
+        uh = copy;
+    }
     CURL h = cei();
     ces(h, CURLOPT_CURLU, uh);
+    // Mutate AFTER assignment: CURLOPT_CURLU keeps the caller's handle live.
+    if (strcmp(mode, "mutate") == 0 || strcmp(mode, "duplicate") == 0) {
+        const char* port = getenv("FRAGMENT_TEST_ORIGIN_PORT");
+        if (cus(uh, 7, "/wrong", 0) ||
+            cus(uh, 5, NULL, 0) ||
+            cus(uh, 5, "127.0.0.1", 0) ||
+            cus(uh, 6, port ? port : "9999", 0) ||
+            cus(uh, 7, "/curl", 0) ||
+            cus(uh, 8, "temporary=1", 0) ||
+            cus(uh, 8, NULL, 0)) return 7;
+    } else if (strcmp(mode, "relative") == 0) {
+        if (cus(uh, CURLUPART_URL, "../curl", 0)) return 7;
+    } else if (strcmp(mode, "reset") == 0) {
+        if (cus(uh, CURLUPART_URL, NULL, 0) ||
+            cus(uh, CURLUPART_URL, url, 0)) return 7;
+    } else if (strcmp(mode, "invalid") == 0) {
+        if (cus(uh, CURLUPART_SCHEME, "invalid scheme", 0) == 0) return 7;
+    }
+
     ces(h, CURLOPT_CONNECTTIMEOUT_MS, (long)3000);
     ces(h, CURLOPT_TIMEOUT_MS, (long)5000);
     ces(h, CURLOPT_NOSIGNAL, (long)1);
@@ -102,5 +130,5 @@ int main(int argc, char **argv) {
 
     if (cec) cec(h);
     if (cuc) cuc(uh);
-    return 0;
+    return (int)rc;
 }

@@ -1,9 +1,10 @@
 import { Matrix, mustRun, run, type Env } from '../../test/harness';
 import { embeddedCases } from './embedded';
+import { redirectCases } from '../../test/redirects';
 
 if (process.platform !== 'win32') throw new Error('Use linux/test/run.ts on Linux');
 const root = `${import.meta.dir}/..`;
-const build = `${root}/build`;
+const build = Bun.env.FRAGMENT_TEST_BUILD ?? `${root}/build`;
 const dll = `${build}/Fragment.dll`;
 const corpus = `${import.meta.dir}/curl`;
 if (!Bun.argv.includes('--no-build')) {
@@ -19,6 +20,7 @@ async function hostCase(name: string, lib: string, args: string[] = [], env: Env
     proxy ? expected : { port: 19999, path: '/curl' }, { ...config, ...env });
 }
 try {
+  await mustRun(['bun', 'test', `${import.meta.dir}/launcher.test.ts`], { FRAGMENT_TEST_BUILD: build });
   for (const [name, cmd] of [
     ['hook engine', [`${build}/hooktest.exe`]],
     ['WinHTTP state and allocation failures', [`${build}/winhttptest.exe`]],
@@ -27,12 +29,20 @@ try {
     const { rc, out } = await run(cmd);
     m.check(name, rc === 0, out.trim());
   }
+  for (const mode of ['notify', 'ldrloaddll', 'loadlibrary']) {
+    const result = await run([`${build}/host_mock.exe`, dll, `${build}/mockcurl.dll`], { FRAGMENT_LOADER: mode });
+    m.check(`mock reload loader=${mode}`, result.rc === 0, result.rc ? result.out : 'rewrite survives eight reloads');
+  }
   const libs = new Set<string>();
   for await (const path of new Bun.Glob('libcurl*.dll').scan({ cwd: corpus, absolute: true })) libs.add(path);
   for (let i = 2; i < Bun.argv.length; i++) if (Bun.argv[i] === '--libcurl') libs.add(Bun.argv[++i]);
   if (!libs.size) m.skip('real shared curl matrix', 'stage test/curl/libcurl*.dll or supply --libcurl <path>');
   for (const lib of libs) {
     console.log(`Testing actual library: ${lib}`);
+    await redirectCases(m.check.bind(m), (url, proxy, disabled) => ({
+      cmd: [`${build}/host.exe`, dll, lib, url, '--follow'],
+      env: { FRAGMENT_PROXY: proxy, FRAGMENT_ENABLED: disabled ? '0' : '1' },
+    }));
     await embeddedCases(m, lib, build, dll, config);
     await hostCase('export URL rewrite', lib);
     await hostCase('bare negative control', lib, ['--noinject'], {}, false);
@@ -45,7 +55,7 @@ try {
       ['ldrex'], { FRAGMENT_LOADER: 'loadlibrary' }, false);
     await m.request('alternate proxy', [`${build}/host.exe`, dll, lib, url],
       { ...expected, port: 19021 }, { FRAGMENT_PROXY: 'http://127.0.0.1:19021' });
-    for (const mode of ['full', 'parts']) await m.request(`URL API ${mode}`,
+    for (const mode of ['full', 'parts', 'mutate', 'relative', 'reset', 'invalid', 'duplicate']) await m.request(`URL API ${mode}`,
       [`${build}/host_urlapi.exe`, dll, lib, mode, url, 'curl'], expected, config);
     await m.request('concurrency 8 x 60', [`${build}/host_stress.exe`, dll, lib, url, '8', '60'], expected, config, 480);
     await m.request('launcher injects passive curl host', [`${build}/fragment.exe`, '--dll', dll, '--',
@@ -73,4 +83,3 @@ try {
       mode === 'auto' ? expected : { port: 19999, path: '/curl' }, { ...config, FRAGMENT_LOADER: mode });
   } else m.skip('transitive dependency', 'requires libcurl-cfw820.dll corpus fixture');
 } finally { m.finish(); }
-

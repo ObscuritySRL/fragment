@@ -23,8 +23,22 @@ export async function forward(request: Request): Promise<Response> {
       body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
       redirect: 'manual', decompress: false, signal: AbortSignal.timeout(30_000),
     });
+    const responseHeaders = endToEnd(response.headers);
+    // The client sees the proxy URL as its base. Resolve upstream redirects
+    // here so /next, ../next, and ?page=2 retain the original authority/path.
+    // Keep the destination on this proxy: automatic WinHTTP redirects need
+    // not call the hooked public connection/request APIs again.
+    const location = responseHeaders.get('location');
+    if (location && response.status >= 300 && response.status < 400) {
+      try {
+        const next = new URL(location, target);
+        if (['http:', 'https:'].includes(next.protocol))
+          responseHeaders.set('location', `${new URL(request.url).origin}/${next.href}`);
+      }
+      catch { /* Preserve malformed upstream values for the client to reject. */ }
+    }
     return new Response(response.body, { status: response.status, statusText: response.statusText,
-      headers: endToEnd(response.headers) });
+      headers: responseHeaders });
   } catch (error) {
     console.error(`Upstream request failed: ${error}`);
     return new Response('Upstream request failed\n', { status: 502 });

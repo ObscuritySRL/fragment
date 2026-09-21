@@ -16,6 +16,7 @@ add_library(Fragment MODULE main.c curl.h util.h log.h config.h hook.h winhttp.h
 # OUTPUT_NAME keeps the shipped binary named fragment.exe. (Ninja keys off the
 # output filenames, which already differ by extension, so it was unaffected.)
 add_executable(fragment_cli tools/fragment.c)
+target_link_libraries(fragment_cli PRIVATE shell32)
 set_target_properties(fragment_cli PROPERTIES OUTPUT_NAME fragment)
 
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -DDEBUG")

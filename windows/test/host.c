@@ -111,6 +111,11 @@ int main(int argc, char **argv) {
     if (!h) { fprintf(stderr, "[host] curl_easy_init returned NULL\n"); return 6; }
 
     ces(h, CURLOPT_URL, url);
+    for (int i = 4; i < argc; ++i) if (!strcmp(argv[i], "--follow")) {
+        ces(h, 52 /* CURLOPT_FOLLOWLOCATION */, 1L);
+        ces(h, 68 /* CURLOPT_MAXREDIRS */, 8L);
+        ces(h, 45 /* CURLOPT_FAILONERROR */, 1L);
+    }
     if (post) ces(h, 10015 /* CURLOPT_POSTFIELDS */, "embedded=hello");
     if (setPort) ces(h, CURLOPT_PORT, (long)9999);   // attempt a port-based bypass
     ces(h, CURLOPT_CONNECTTIMEOUT_MS, (long)3000);

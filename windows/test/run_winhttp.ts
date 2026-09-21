@@ -1,4 +1,5 @@
 import { Matrix, mustRun, type Env } from '../../test/harness';
+import { redirectCases } from '../../test/redirects';
 
 if (process.platform !== 'win32') throw new Error('WinHTTP tests require Windows');
 const root = `${import.meta.dir}/..`;
@@ -20,6 +21,9 @@ async function request(name: string, url: string, mode = '', args: string[] = []
     { port, path, method: mode === 'post' ? 'POST' : 'GET', body }, { ...debug, ...env }, count);
 }
 try {
+  await redirectCases(m.check.bind(m), (url, proxy, disabled) => ({
+    cmd: [host, dll, url], env: { FRAGMENT_PROXY: proxy, FRAGMENT_ENABLED: disabled ? '0' : '1' },
+  }));
   for (const url of ['http://127.0.0.1:19999/basic', 'https://example.com/secure',
     'https://example.com:8443/port', 'http://example.com:8080/port',
     'https://example.com/a/b?x=1&y=2', 'https://example.com/']) await request(url, url);
@@ -45,5 +49,4 @@ try {
   await request('concurrency 8 x 60', 'https://example.com/stress', 'stress', ['8', '60'], {},
     19020, '/https://example.com/stress', 480);
 } finally { m.finish(); }
-
 

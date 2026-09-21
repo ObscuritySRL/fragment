@@ -55,6 +55,20 @@ static WhOpenRequestFn gWhOpenRequest = NULL;
 static WhCloseHandleFn gWhClose       = NULL;
 static WhSetOptionFn   gWhSetOption   = NULL;
 static volatile LONG  gWhActive      = 0; /* all five hooks must be usable */
+static HMODULE        gWhModule      = NULL;
+
+/* Called under gHookLock by the unload notification. No live WinHTTP handles
+ * may be used after their owning implementation is unloaded. */
+static void WhModuleUnloaded(HMODULE module) {
+    if (gWhModule != module) return;
+    InterlockedExchange(&gWhActive, 0);
+    gWhOpen = NULL;
+    gWhConnect = NULL;
+    gWhOpenRequest = NULL;
+    gWhClose = NULL;
+    gWhSetOption = NULL;
+    gWhModule = NULL;
+}
 
 /* ---- hConnect -> original (host, port) map ---------------------------- */
 typedef struct WhConn {
@@ -273,6 +287,11 @@ void HookWinHttp(HMODULE module) {
     if (!WhIsWinHttp(module, nm)) return;
 
     if (gHookLockReady) EnterCriticalSection(&gHookLock);
+    if (gWhModule && gWhModule != module) {
+        if (gHookLockReady) LeaveCriticalSection(&gHookLock);
+        return;
+    }
+    gWhModule = module;
     /* Construct gWhLock exactly once, serialized by gHookLock (or single-threaded
      * during the DllMain sweep, before gHookLock is ready). Publishing
      * gWhLockReady only AFTER InitializeCriticalSection completes -- and binding

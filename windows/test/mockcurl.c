@@ -10,6 +10,7 @@
  */
 #include <windows.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <string.h>
 
 #define CURLOPT_PORT              3
@@ -25,6 +26,7 @@ static void* g_lastProxy    = (void*)~(UINT_PTR)0;  /* sentinel != NULL */
 static void* g_lastUnix     = (void*)~(UINT_PTR)0;  /* sentinel != NULL */
 static void* g_lastAbstract = (void*)~(UINT_PTR)0;  /* sentinel != NULL */
 static long  g_lastPort = -1;
+static int64_t g_lastOffset;
 
 __declspec(dllexport) void* curl_easy_init(void) { return (void*)(UINT_PTR)0x1234; }
 
@@ -44,6 +46,8 @@ __declspec(dllexport) int curl_easy_setopt(void* handle, int option, ...) {
         g_lastUnix = va_arg(ap, void*);
     } else if (option == CURLOPT_ABSTRACT_UNIX_SOCKET) {
         g_lastAbstract = va_arg(ap, void*);
+    } else if (option >= 30000 && option < 40000) {
+        g_lastOffset = va_arg(ap, int64_t);
     } else if (option == CURLOPT_PORT) {
         g_lastPort = va_arg(ap, long);
     }
@@ -60,3 +64,5 @@ __declspec(dllexport) void*       mock_last_proxy(void)   { return g_lastProxy; 
 __declspec(dllexport) void*       mock_last_unix(void)     { return g_lastUnix; }
 __declspec(dllexport) void*       mock_last_abstract(void) { return g_lastAbstract; }
 __declspec(dllexport) long        mock_last_port(void)     { return g_lastPort; }
+
+__declspec(dllexport) int64_t mock_last_offset(void) { return g_lastOffset; }

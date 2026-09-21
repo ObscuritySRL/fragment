@@ -194,15 +194,16 @@ inline CurlSetoptFn GenerateCaller(LPVOID pFirstParam, LPVOID pCalled) {
     // __cdecl passes everything on the stack, so we cannot prepend the context
     // by a register shuffle as on x86-64; we build a fresh call frame instead.
     // Frame: save ebp, then `and esp,-16` realigns to the 16-byte boundary the
-    // compiler-built detour may assume (aligned SSE), re-push (curl, option,
-    // value) from the saved frame, prepend the context, and call the shared C
+    // compiler-built detour may assume (aligned SSE), pass (curl, option,
+    // vararg-address) from the saved frame, prepend the context, and call the C
     // detour. `leave; ret` tears the frame down and returns to the original
     // caller (cdecl: the caller pops the original args).
     const byte code[] = {
             0x55,                         // push ebp
             0x89, 0xE5,                   // mov ebp, esp
             0x83, 0xE4, 0xF0,             // and esp, -16
-            0xFF, 0x75, 0x10,             // push [ebp+16]  (value)
+            0x8D, 0x45, 0x10,             // lea eax, [ebp+16] (original varargs)
+            0x50,                         // push eax
             0xFF, 0x75, 0x0C,             // push [ebp+12]  (option)
             0xFF, 0x75, 0x08,             // push [ebp+8]   (curl)
             0x68, 0,0,0,0,                // push <ctx>
@@ -215,8 +216,8 @@ inline CurlSetoptFn GenerateCaller(LPVOID pFirstParam, LPVOID pCalled) {
     byte* allocatedCode = VirtualAlloc(NULL, sizeof(code), MEM_COMMIT, PAGE_READWRITE);
     if (!allocatedCode) return NULL;
     memcpy(allocatedCode, code, sizeof(code));
-    memcpy(allocatedCode+16, &pFirstParam, sizeof(pFirstParam));
-    memcpy(allocatedCode+21, &pCalled, sizeof(pCalled));
+    memcpy(allocatedCode+17, &pFirstParam, sizeof(pFirstParam));
+    memcpy(allocatedCode+22, &pCalled, sizeof(pCalled));
 
     DWORD dummy;
     VirtualProtect(allocatedCode, sizeof(code), PAGE_EXECUTE_READ, &dummy);

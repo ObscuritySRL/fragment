@@ -187,15 +187,16 @@ static CurlSetoptFn GenerateCaller(void* pFirstParam, void* pCalled) {
     // __cdecl passes everything on the stack, so we cannot prepend the context
     // by a register shuffle as on x86-64; we build a fresh call frame instead.
     // Frame: save ebp, then `and esp,-16` realigns to the 16-byte boundary the
-    // SysV i386 ABI requires (the gcc-built detour may use aligned SSE), re-push
-    // (curl, option, value) from the saved frame, prepend the context, and call
+    // SysV i386 ABI requires (the gcc-built detour may use aligned SSE), pass
+    // (curl, option, vararg-address) from the saved frame, prepend context, and call
     // the shared C detour. `leave; ret` tears the frame down and returns to the
     // original caller (cdecl: the caller pops the original args).
     uint8_t code[] = {
         0x55,                                           // push ebp
         0x89, 0xE5,                                     // mov ebp, esp
         0x83, 0xE4, 0xF0,                               // and esp, -16
-        0xFF, 0x75, 0x10,                               // push [ebp+16]  (value)
+        0x8D, 0x45, 0x10,                               // lea eax, [ebp+16] (varargs)
+        0x50,                                           // push eax
         0xFF, 0x75, 0x0C,                               // push [ebp+12]  (option)
         0xFF, 0x75, 0x08,                               // push [ebp+8]   (curl)
         0x68, 0,0,0,0,                                  // push <ctx>
@@ -204,8 +205,8 @@ static CurlSetoptFn GenerateCaller(void* pFirstParam, void* pCalled) {
         0xC9,                                           // leave
         0xC3,                                           // ret
     };
-    memcpy(code + 16, &pFirstParam, sizeof(pFirstParam));
-    memcpy(code + 21, &pCalled, sizeof(pCalled));
+    memcpy(code + 17, &pFirstParam, sizeof(pFirstParam));
+    memcpy(code + 22, &pCalled, sizeof(pCalled));
     return (CurlSetoptFn) EmitStub(code, sizeof(code));
 }
 
@@ -235,21 +236,23 @@ static CurlUrlSetFn GenerateUrlSetCaller(void* pContext, void* pCalled) {
 
 #elif defined(__arm__)
 static CurlSetoptFn GenerateCaller(void* pFirstParam, void* pCalled) {
-    // AAPCS: r0-r3. Shift (curl, option, value) right one register, put the
-    // context in r0, and branch to the detour. Emitted as A32 and entered with
-    // bit 0 clear (the relay clears it), so it runs as ARM and interworks to the
-    // detour via the loaded word regardless of the .so's own state.
+    // Save the original r2/r3 vararg pair and pass its address as argument 4.
+    // curl_off_t is aligned to the r2/r3 pair under AAPCS; saving only r2 would
+    // lose its high word. The 16-byte frame preserves stack alignment.
     uint8_t code[] = {
-        0x02, 0x30, 0xA0, 0xE1,                         // mov r3, r2   (value)
+        0x1C, 0x40, 0x2D, 0xE9,                         // push {r2,r3,r4,lr}
+        0x0D, 0x30, 0xA0, 0xE1,                         // mov r3, sp
         0x01, 0x20, 0xA0, 0xE1,                         // mov r2, r1   (option)
         0x00, 0x10, 0xA0, 0xE1,                         // mov r1, r0   (curl)
-        0x00, 0x00, 0x9F, 0xE5,                         // ldr r0, [pc]   -> ctx
-        0x00, 0xF0, 0x9F, 0xE5,                         // ldr pc, [pc]   -> detour
+        0x08, 0x00, 0x9F, 0xE5,                         // ldr r0, [pc,#8] -> ctx
+        0x08, 0xC0, 0x9F, 0xE5,                         // ldr ip, [pc,#8] -> detour
+        0x3C, 0xFF, 0x2F, 0xE1,                         // blx ip
+        0x1C, 0x80, 0xBD, 0xE8,                         // pop {r2,r3,r4,pc}
         0,0,0,0,                                        // .word ctx
         0,0,0,0,                                        // .word detour
     };
-    memcpy(code + 20, &pFirstParam, sizeof(pFirstParam));
-    memcpy(code + 24, &pCalled, sizeof(pCalled));
+    memcpy(code + 32, &pFirstParam, sizeof(pFirstParam));
+    memcpy(code + 36, &pCalled, sizeof(pCalled));
     return (CurlSetoptFn) EmitStub(code, sizeof(code));
 }
 

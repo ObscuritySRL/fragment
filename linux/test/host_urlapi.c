@@ -36,6 +36,7 @@ typedef void* CURLU;
 
 extern int    curl_global_init(long);
 extern CURLU  curl_url(void);
+extern CURLU  curl_url_dup(CURLU);
 extern int    curl_url_set(CURLU, int, const char*, unsigned int);
 extern void   curl_url_cleanup(CURLU);
 extern CURL   curl_easy_init(void);
@@ -70,8 +71,33 @@ int main(int argc, char** argv) {
         curl_url_set(uh, CURLUPART_URL, url, 0);
     }
 
+    if (strcmp(mode, "duplicate") == 0) {
+        CURLU copy = curl_url_dup(uh);
+        if (!copy) return 6;
+        curl_url_cleanup(uh);
+        uh = copy;
+    }
     CURL h = curl_easy_init();
     curl_easy_setopt(h, CURLOPT_CURLU, uh);
+    // Mutate AFTER assignment: CURLOPT_CURLU keeps the caller's handle live.
+    if (strcmp(mode, "mutate") == 0 || strcmp(mode, "duplicate") == 0) {
+        const char* port = getenv("FRAGMENT_TEST_ORIGIN_PORT");
+        if (curl_url_set(uh, 7, "/wrong", 0) ||
+            curl_url_set(uh, 5, NULL, 0) ||
+            curl_url_set(uh, 5, "127.0.0.1", 0) ||
+            curl_url_set(uh, 6, port ? port : "9999", 0) ||
+            curl_url_set(uh, 7, "/curl", 0) ||
+            curl_url_set(uh, 8, "temporary=1", 0) ||
+            curl_url_set(uh, 8, NULL, 0)) return 7;
+    } else if (strcmp(mode, "relative") == 0) {
+        if (curl_url_set(uh, CURLUPART_URL, "../curl", 0)) return 7;
+    } else if (strcmp(mode, "reset") == 0) {
+        if (curl_url_set(uh, CURLUPART_URL, NULL, 0) ||
+            curl_url_set(uh, CURLUPART_URL, url, 0)) return 7;
+    } else if (strcmp(mode, "invalid") == 0) {
+        if (curl_url_set(uh, CURLUPART_SCHEME, "invalid scheme", 0) == 0) return 7;
+    }
+
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, (long)3000);
     curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, (long)5000);
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, (long)1);
@@ -82,5 +108,5 @@ int main(int argc, char** argv) {
 
     curl_easy_cleanup(h);
     curl_url_cleanup(uh);
-    return 0;
+    return (int)rc;
 }
