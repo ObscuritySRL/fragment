@@ -18,6 +18,9 @@
  *   FRAGMENT_PROXY_PORT   port when FRAGMENT_PROXY is unset (default 9020)
  *   FRAGMENT_ENABLED      0/false/no/off => do not hook at all
  *   FRAGMENT_DISABLE      1/true/yes/on  => do not hook at all
+ *   FRAGMENT_MODE         redirect (default) or observe (Windows TLS/sockets)
+ *   FRAGMENT_CAPTURE_FILE new output file, required by observe mode
+ *   FRAGMENT_SOCKET_DATA  1 => also retain synchronous raw socket bytes
  *   FRAGMENT_LOG_LEVEL    off|error|warn|info|debug
  *   FRAGMENT_LOG_FILE     path; if unset, logs go to the debugger output
  *   FRAGMENT_LOG_CONSOLE  1 => allocate a console and tee stdout there
@@ -40,6 +43,10 @@ enum {
 
 typedef struct {
     BOOL   enabled;
+    BOOL   observe;           /* capture TLS plaintext; never rewrite URLs */
+    BOOL   socketData;        /* explicitly requested raw synchronous bytes */
+    BOOL   valid;
+    wchar_t captureFileW[32768];
     char   proxyPrefix[600];   /* always ends in '/', e.g. http://h:p/ */
     size_t proxyPrefixLen;
     int    loaderMode;         /* one of FRAG_LOADER_*                  */
@@ -102,6 +109,28 @@ static void ConfigInit(void) {
     if (buf[0] && EnvFalsey(buf)) gCfg.enabled = FALSE;
     EnvGet("FRAGMENT_DISABLE", buf, sizeof(buf));
     if (buf[0] && EnvTruthy(buf)) gCfg.enabled = FALSE;
+
+    /* Observation must never fall back to redirection on a typo. */
+    gCfg.valid = TRUE;
+    DWORD modeLength = GetEnvironmentVariableA("FRAGMENT_MODE", buf, sizeof(buf));
+    if (modeLength >= sizeof(buf)) {
+        buf[0] = 0;
+        gCfg.valid = FALSE;
+        LogError("[Fragment] oversized FRAGMENT_MODE\n");
+    } else if (!modeLength) buf[0] = 0;
+    gCfg.observe = !_stricmp(buf, "observe");
+    if (buf[0] && _stricmp(buf, "redirect") && !gCfg.observe) {
+        LogError("[Fragment] invalid FRAGMENT_MODE; expected redirect or observe\n");
+        gCfg.valid = FALSE;
+    }
+    DWORD captureLen = GetEnvironmentVariableW(L"FRAGMENT_CAPTURE_FILE", gCfg.captureFileW,
+                                               (DWORD)(sizeof(gCfg.captureFileW) / sizeof(wchar_t)));
+    if (gCfg.observe && (!captureLen || captureLen >= sizeof(gCfg.captureFileW) / sizeof(wchar_t))) {
+        LogError("[Fragment] observe mode requires FRAGMENT_CAPTURE_FILE\n");
+        gCfg.valid = FALSE;
+    }
+    EnvGet("FRAGMENT_SOCKET_DATA", buf, sizeof(buf));
+    gCfg.socketData = gCfg.observe && EnvTruthy(buf);
 
     /* -- module-load interception strategy ------------------------------- */
     char ldr[32];

@@ -1,4 +1,5 @@
 /* Exercise partial activation and allocation failures without touching WinHTTP. */
+#include <winsock2.h>
 #include <windows.h>
 #include <stdlib.h>
 #include <stdio.h>

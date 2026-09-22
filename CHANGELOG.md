@@ -4,6 +4,30 @@ All notable changes to **Fragment** are documented in this file.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-22
+
+### Added
+- Windows observation mode: `--observe <new.jsonl>` records supported Schannel and exported OpenSSL plaintext plus Winsock activity while preserving the application's destinations, TLS verification, and proxy settings.
+- Optional `--socket-data` capture for successful synchronous TCP/UDP payloads, including binary data and scatter/gather calls. Socket records include numeric IPv4/IPv6 endpoints, outcomes, errors, and measured byte counts.
+- A binary-safe JSONL capture format with timestamps, process/thread IDs, context lifetimes, and explicit gaps and truncation. Existing capture files are never overwritten.
+- An offline HTML viewer (`bun tools/observe.ts capture.jsonl --out capture.html`) with socket filtering and separate inbound/outbound text, hex, and individual-chunk views. The viewer is included in both platform packages; recording remains Windows-only.
+- Native observer state tests, loopback TLS/TCP/UDP integrations, exported mock OpenSSL reload tests, capture-sink tests, and viewer validation. Windows observation checks are included in x64, x86, ARM64, and release workflows.
+
+### Fixed
+- Use the matching `Fragment.dll` for an x86 launcher and x86 target instead of incorrectly choosing the cross-bitness bridge. Unsupported launcher/target architecture combinations are rejected.
+- Reject invalid observation configuration without silently enabling redirection, and stop a newly launched observation target if injection fails.
+
+### Documentation and packages
+- Expanded README and agent guidance for both modes, loaded-module discovery, configuration, attachment, verification, build/test workflows, and coverage limits.
+- Included the observation viewer and linked validation guides in release packages.
+
+### Coverage and limits
+- Windows scans already-loaded and later-loaded modules for the selected backends; curl and exported OpenSSL discovery do not depend on DLL filenames. Unsupported or ambiguous hooks remain inactive.
+- Observation does not provide universal plaintext capture: static/hidden TLS implementations, QUIC plaintext, IPC, and unhooked networking APIs remain outside coverage. Asynchronous Winsock submissions are recorded without completion tracking or payload capture. Child processes are not automatically followed.
+- Captures use synchronous disk writes and have no rotation or total-size cap. Payload records are capped at 1 MiB with truncation markers; the offline viewer accepts up to 128 MiB. A disk write failure stops recording while the application continues.
+- Local x64/x86 validation includes Schannel, socket traffic, capture state, mock-library reloads, and specific OpenSSL 3.0 builds. Fixture results do not establish compatibility with every application or TLS library.
+- Packages remain Windows x64 and Linux x64/ARM64. Linux retains libcurl redirection; it gains no TLS/socket capture backend. The 64-bit-to-x86 bridge still cannot guarantee capture from the first instruction of target startup.
+
 ## [1.2.1] - 2026-09-21
 
 ### Fixed

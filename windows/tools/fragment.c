@@ -6,9 +6,9 @@
  *   fragment [options] -- <program> [args...]   launch the program & inject
  *   fragment [options] --pid <pid>              inject into a running process
  *
- * The loader is x64. It injects Fragment.dll into native x64 targets and the
- * 32-bit Fragment32.dll into 32-bit (WOW64) targets, picking the right module
- * by the target's bitness. Build: part of the CMake project (fragment.exe).
+ * A same-architecture target uses Fragment.dll. A 64-bit launcher can bridge
+ * to an x86 target with Fragment32.dll; other architecture mismatches fail.
+ * Build: part of the CMake project (fragment.exe).
  */
 #include <windows.h>
 #include <tlhelp32.h>
@@ -23,42 +23,59 @@
 
 static void usage(void) {
     fprintf(stderr,
-        "Fragment loader -- redirect a program's libcurl traffic through a proxy.\n\n"
+        "Fragment loader -- redirect HTTP APIs or observe TLS and socket activity.\n\n"
         "Usage:\n"
         "  fragment [options] -- <program> [args...]   launch & inject\n"
         "  fragment [options] --pid <pid>              inject into a running process\n\n"
         "Options:\n"
         "  --dll <path>      DLL to inject (default: Fragment.dll, or Fragment32.dll\n"
-        "                    for a 32-bit target, next to fragment.exe)\n"
+        "                    for 64-bit-to-x86 injection, next to fragment.exe)\n"
         "  --proxy <url>     proxy base, e.g. http://127.0.0.1:9020  (FRAGMENT_PROXY)\n"
+        "  --observe <file>  record Schannel/OpenSSL plaintext and Winsock activity\n"
+        "                    to a NEW JSONL file; preserve original connections\n"
+        "                    (FRAGMENT_MODE=observe,\n"
+        "                    FRAGMENT_CAPTURE_FILE). No proxy needed.\n"
+        "  --socket-data     also capture raw synchronous socket bytes in observe\n"
+        "                    mode (may be ciphertext; FRAGMENT_SOCKET_DATA=1)\n"
         "  --host <host>     proxy host                              (FRAGMENT_PROXY_HOST)\n"
         "  --port <port>     proxy port                             (FRAGMENT_PROXY_PORT)\n"
         "  --log <level>     off|error|warn|info|debug              (FRAGMENT_LOG_LEVEL)\n"
         "  --log-file <p>    write diagnostics to a file            (FRAGMENT_LOG_FILE)\n"
         "  --loader <how>    auto|notify|ldrloaddll|loadlibrary     (FRAGMENT_LOADER)\n"
-        "  --off             inject but leave rewriting disabled    (FRAGMENT_ENABLED=0)\n"
+        "  --off             inject but disable all hooks/capture   (FRAGMENT_ENABLED=0)\n"
         "  -h, --help        show this help\n"
         "  -V, --version     print the Fragment version\n\n"
-        "Note: --proxy/--host/--port/--log* configure LAUNCHED targets (they are passed\n"
+        "Note: configuration flags apply to LAUNCHED targets (they are passed\n"
         "via the inherited environment). For --pid, set those environment variables\n"
         "before the target starts, or system-wide.\n");
 }
 
-/* Which Fragment.dll a target needs follows its bitness: a 32-bit (WOW64)
- * target loads only the 32-bit Fragment32.dll, a native x64 target the x64
- * Fragment.dll. Returns 1 if the target is a native x64 process, 0 if it is
- * 32-bit. */
-static int target_is_x64(HANDLE hProc) {
+/* 1: same architecture (Fragment.dll); 0: 64-bit launcher -> x86 bridge
+ * (Fragment32.dll); -1: unsupported cross-architecture injection. WOW64 is
+ * a property of the target, not proof the launcher has a different bitness. */
+static int target_injection_mode(HANDLE hProc) {
     typedef BOOL (WINAPI *Wow64_2)(HANDLE, USHORT*, USHORT*);
     Wow64_2 fn = (Wow64_2)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "IsWow64Process2");
     if (fn) {
         USHORT proc = 0, native = 0;
-        if (fn(hProc, &proc, &native))
-            return proc == IMAGE_FILE_MACHINE_UNKNOWN;   /* not WOW64 => native x64 */
+        if (fn(hProc, &proc, &native)) {
+            USHORT target = proc ? proc : native;
+#if defined(_M_ARM64) || defined(__aarch64__)
+            USHORT self = IMAGE_FILE_MACHINE_ARM64;
+#elif defined(_M_IX86) || defined(__i386__)
+            USHORT self = IMAGE_FILE_MACHINE_I386;
+#else
+            USHORT self = IMAGE_FILE_MACHINE_AMD64;
+#endif
+            if (target == self) return 1;
+            if (sizeof(void*) == 8 && target == IMAGE_FILE_MACHINE_I386) return 0;
+            return -1;
+        }
     }
-    BOOL wow = FALSE;
-    if (IsWow64Process(hProc, &wow)) return !wow;        /* on x64 Windows, !WOW64 => x64 */
-    return 1;                                            /* undetermined: allow */
+    BOOL targetWow = FALSE, selfWow = FALSE;
+    if (!IsWow64Process(hProc, &targetWow) || !IsWow64Process(GetCurrentProcess(), &selfWow)) return -1;
+    if (sizeof(void*) == 8) return targetWow ? 0 : 1;
+    return selfWow && !targetWow ? -1 : 1;
 }
 
 /* Read `n` bytes at remote address `base+rva` in the process behind `ctx`; the
@@ -191,6 +208,8 @@ static const char* resolve_dll(const char* userDll, int wow64, char* buf, DWORD 
 int main(int argc, char** argv) {
     const char *dll = NULL, *proxy = NULL, *host = NULL, *port = NULL, *log = NULL, *logfile = NULL, *loader = NULL;
     int off = 0, launchIdx = -1;
+    int observeIdx = -1;
+    int socketData = 0;
     DWORD pid = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -198,6 +217,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--pid") && i + 1 < argc) pid = (DWORD)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--dll") && i + 1 < argc) dll = argv[++i];
         else if (!strcmp(argv[i], "--proxy") && i + 1 < argc) proxy = argv[++i];
+        else if (!strcmp(argv[i], "--observe") && i + 1 < argc) observeIdx = ++i;
+        else if (!strcmp(argv[i], "--socket-data")) socketData = 1;
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = argv[++i];
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) log = argv[++i];
@@ -211,6 +232,14 @@ int main(int argc, char** argv) {
     if (pid == 0 && launchIdx < 0) { usage(); return 2; }
     if (pid != 0 && launchIdx >= 0) { fprintf(stderr, "[fragment] choose either --pid or -- <program>, not both\n"); return 2; }
     if (launchIdx >= 0 && launchIdx >= argc) { fprintf(stderr, "[fragment] '--' must be followed by a program\n"); return 2; }
+    if (observeIdx >= 0 && (proxy || host || port)) {
+        fprintf(stderr, "[fragment] --observe preserves original connections; omit proxy flags\n");
+        return 2;
+    }
+    if (pid && (observeIdx >= 0 || socketData)) {
+        fprintf(stderr, "[fragment] --observe cannot configure an existing process; launch with --observe or set FRAGMENT_MODE and FRAGMENT_CAPTURE_FILE before the target starts\n");
+        return 2;
+    }
     if (pid && (proxy || host || port || log || logfile || loader || off))
         fprintf(stderr, "[fragment] --pid uses the target's existing environment; configuration flags cannot change it\n");
 
@@ -231,6 +260,32 @@ int main(int argc, char** argv) {
     if (launchIdx >= 0) {
         int wideArgc = 0;
         wchar_t** wideArgv = CommandLineToArgvW(GetCommandLineW(), &wideArgc);
+        if (observeIdx >= 0) {
+            wchar_t capturePath[32768];
+            DWORD n = wideArgv && wideArgc == argc && wideArgv[observeIdx][0]
+                ? GetFullPathNameW(wideArgv[observeIdx], 32768, capturePath, NULL) : 0;
+            if (!n || n >= 32768 ||
+                (!off && GetFileAttributesW(capturePath) != INVALID_FILE_ATTRIBUTES)) {
+                fprintf(stderr, "[fragment] --observe requires a new file path (existing captures are never overwritten)\n");
+                if (wideArgv) LocalFree(wideArgv);
+                return 2;
+            }
+            if (!SetEnvironmentVariableW(L"FRAGMENT_CAPTURE_FILE", capturePath) ||
+                !SetEnvironmentVariableW(L"FRAGMENT_MODE", L"observe")) {
+                fprintf(stderr, "[fragment] cannot configure capture environment\n");
+                LocalFree(wideArgv);
+                return 4;
+            }
+        }
+        char selectedMode[32] = {0};
+        GetEnvironmentVariableA("FRAGMENT_MODE", selectedMode, sizeof(selectedMode));
+        BOOL observing = !_stricmp(selectedMode, "observe");
+        if ((socketData && !observing) || (observing && (proxy || host || port))) {
+            fprintf(stderr, "[fragment] --socket-data requires observation mode; proxy flags require redirection mode\n");
+            if (wideArgv) LocalFree(wideArgv);
+            return 2;
+        }
+        if (socketData) SetEnvironmentVariableA("FRAGMENT_SOCKET_DATA", "1");
         wchar_t* cmd = wideArgv && wideArgc == argc
             ? FragmentCommandLine(argc - launchIdx, wideArgv + launchIdx) : NULL;
         if (wideArgv) LocalFree(wideArgv);
@@ -247,7 +302,15 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[fragment] CreateProcess failed %lu\n", createError);
             return 4;
         }
-        int wow = !target_is_x64(pi.hProcess);
+        int injectionMode = target_injection_mode(pi.hProcess);
+        if (injectionMode < 0) {
+            fprintf(stderr, "[fragment] target architecture is not supported by this launcher; use a matching build\n");
+            TerminateProcess(pi.hProcess, 3);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return 3;
+        }
+        int wow = injectionMode == 0;
         path = resolve_dll(dll, wow, dllbuf, sizeof(dllbuf));
         if (!path) {
             TerminateProcess(pi.hProcess, 1);   /* never leave a wedged suspended child */
@@ -263,9 +326,20 @@ int main(int argc, char** argv) {
          * after. Either way the thread is resumed exactly once. */
         if (wow) ResumeThread(pi.hThread);
         int ok = inject_into(pi.hProcess, path, wow);
+        char mode[32] = {0};
+        GetEnvironmentVariableA("FRAGMENT_MODE", mode, sizeof(mode));
+        if (!ok && !_stricmp(mode, "observe")) {
+            /* This is our newly created child. A native child is still suspended;
+             * do not run it unobserved after failing to initialize capture. */
+            TerminateProcess(pi.hProcess, 5);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            fprintf(stderr, "[fragment] observation setup failed; launched target stopped\n");
+            return 5;
+        }
         if (!wow) ResumeThread(pi.hThread);
-        if (ok) printf("[fragment] DLL loaded in pid %lu; hook installation and traffic capture are not verified. Check Fragment logs and your proxy.\n", pi.dwProcessId);
-        else    fprintf(stderr, "[fragment] injection failed; target runs un-proxied\n");
+        if (ok) printf("[fragment] DLL loaded in pid %lu; hook installation and traffic capture are not verified. Check Fragment logs and proxy/capture output.\n", pi.dwProcessId);
+        else    fprintf(stderr, "[fragment] injection failed; target runs without Fragment\n");
         WaitForSingleObject(pi.hProcess, INFINITE);
         DWORD ec = 0;
         GetExitCodeProcess(pi.hProcess, &ec);
@@ -277,13 +351,19 @@ int main(int argc, char** argv) {
             PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
             PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
         if (!hProc) { fprintf(stderr, "[fragment] OpenProcess(%lu) failed %lu\n", pid, GetLastError()); return 4; }
-        int wow = !target_is_x64(hProc);
+        int injectionMode = target_injection_mode(hProc);
+        if (injectionMode < 0) {
+            fprintf(stderr, "[fragment] target architecture is not supported by this launcher; use a matching build\n");
+            CloseHandle(hProc);
+            return 3;
+        }
+        int wow = injectionMode == 0;
         path = resolve_dll(dll, wow, dllbuf, sizeof(dllbuf));
         if (!path) { CloseHandle(hProc); return 3; }
         int ok = inject_into(hProc, path, wow);
         CloseHandle(hProc);
         if (!ok) { fprintf(stderr, "[fragment] injection into pid %lu failed\n", pid); return 5; }
-        printf("[fragment] DLL loaded in pid %lu; hook installation and traffic capture are not verified. Check Fragment logs and your proxy.\n", pid);
+        printf("[fragment] DLL loaded in pid %lu; hook installation and traffic capture are not verified. Check Fragment logs and proxy/capture output.\n", pid);
         return 0;
     }
 }

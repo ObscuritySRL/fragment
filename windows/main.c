@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <winsock2.h>
 #include <windows.h>
 #include <psapi.h>
 #include "log.h"
@@ -280,6 +281,10 @@ static void HookLockInit(void) {
 // serialize its resolve+dedup+install against the curl backend's shared hook
 // registry, so it is included here rather than at the top of the file.
 #include "winhttp.h"
+#include "capture.h"
+#include "schannel.h"
+#include "openssl_capture.h"
+#include "network.h"
 
 void HookCurl(HMODULE module) {
     if (!module) return;
@@ -345,11 +350,17 @@ void HookCurl(HMODULE module) {
 }
 
 // Run every per-module backend over a freshly observed module. New backends
-// (WinHTTP today; WinINet / Schannel / ... next) hang off this single fan-out,
+// (HTTP redirection or optional TLS/socket observation) use this fan-out,
 // which every module-load path below and the already-mapped sweep invoke.
 static void HookModule(HMODULE module) {
-    HookCurl(module);
-    HookWinHttp(module);
+    if (gCfg.observe) {
+        HookSchannel(module);
+        HookOpenSsl(module);
+        HookNetwork(module);
+    } else {
+        HookCurl(module);
+        HookWinHttp(module);
+    }
 }
 
 typedef HMODULE(*LoadLibraryAFn)(LPCSTR lpLibFileName);
@@ -417,6 +428,9 @@ static VOID CALLBACK DllLoadNotification(ULONG reason,
         EnterCriticalSection(&gHookLock);
         FrForgetModule(data->DllBase, data->SizeOfImage);
         WhModuleUnloaded((HMODULE)data->DllBase);
+        SchannelModuleUnloaded((HMODULE)data->DllBase);
+        OpenSslModuleUnloaded((HMODULE)data->DllBase);
+        NetworkModuleUnloaded((HMODULE)data->DllBase);
         LeaveCriticalSection(&gHookLock);
     } else if (reason == FR_LDR_DLL_NOTIFICATION_REASON_LOADED &&
                (gCfg.loaderMode == FRAG_LOADER_AUTO || gCfg.loaderMode == FRAG_LOADER_NOTIFY))
@@ -494,18 +508,25 @@ BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID lpvReserved) {
 
     DisableThreadLibraryCalls(hinstDLL);
     ConfigInit();
-    LogInfo("[Fragment] %s attach pid=%lu enabled=%d proxy=%s\n",
-            FRAGMENT_VERSION, GetCurrentProcessId(), (int)gCfg.enabled, gCfg.proxyPrefix);
+    LogInfo("[Fragment] %s attach pid=%lu enabled=%d mode=%s\n",
+            FRAGMENT_VERSION, GetCurrentProcessId(), (int)gCfg.enabled,
+            gCfg.observe ? "observe" : "redirect");
+    if (!gCfg.observe) LogInfo("[Fragment] proxy=%s\n", gCfg.proxyPrefix);
     if (!gCfg.enabled) {
         LogInfo("[Fragment] disabled via environment; not hooking\n");
         return TRUE;
     }
+    if (!gCfg.valid) return FALSE;
+    if (gCfg.observe && !CaptureInit(gCfg.captureFileW)) return FALSE;
 
     // Neutralize env-var proxies up front (the setopt hook can't see them).
-    ScrubProxyEnv();
+    if (!gCfg.observe) ScrubProxyEnv();
 
     HookEngineInit();
     HookLockInit();
+    if (gCfg.observe) SchannelInit();
+    if (gCfg.observe) OpenSslInit();
+    if (gCfg.observe) NetworkInit();
 
     // Pin ourselves so a stray FreeLibrary cannot unmap the DLL while our
     // loader-notification callback is still registered (a dangling callback
@@ -552,7 +573,7 @@ BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID lpvReserved) {
     }
 
     if (!notify && !ldrHook && !llHook)
-        LogError("[Fragment] no dynamic-load interception engaged; only already-mapped curl will be hooked\n");
+        LogError("[Fragment] no dynamic-load interception engaged; only already-mapped modules will be inspected\n");
 
     // THEN sweep already-mapped modules (covers a curl loaded before us), with a
     // dynamically sized buffer so a large host's module list is never truncated.

@@ -47,6 +47,14 @@ jobs:
           cl /nologo /O2 /MD /W3 windows\test\host_winhttp.c /Fe:windows\build\Release\host_winhttp.exe /Fo:windows\build\host_winhttp.obj || exit /b 1
           bun windows/test/run_winhttp.ts --no-build || exit /b 1
 
+      - name: Test observation in the release binary
+        shell: cmd
+        env:
+          FRAGMENT_TEST_BUILD: ${{ github.workspace }}/windows/build/Release
+        run: |
+          call windows\test\build_observe.bat windows\build\Release || exit /b 1
+          bun run test:observe || exit /b 1
+
       - name: Stage package
         shell: pwsh
         run: |
@@ -59,9 +67,12 @@ jobs:
           Copy-Item AGENTS.md  $stage/
           New-Item -ItemType Directory -Path "$stage/tools" | Out-Null
           Copy-Item tools/proxy.ts "$stage/tools/"
+          Copy-Item tools/observe.ts "$stage/tools/"
           Copy-Item CHANGELOG.md, BRIEF.md $stage/
           New-Item -ItemType Directory -Path "$stage/docs" | Out-Null
           Copy-Item docs/regression-validation.md "$stage/docs/"
+          Copy-Item docs/observation.md "$stage/docs/"
+          Copy-Item docs/verification.md "$stage/docs/"
           Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
 
       - name: Upload package artifact
@@ -104,9 +115,11 @@ jobs:
           cp AGENTS.md "$stage"/
           mkdir -p "$stage/tools"
           cp tools/proxy.ts "$stage/tools/"
+          cp tools/observe.ts "$stage/tools/"
           cp CHANGELOG.md BRIEF.md "$stage/"
           mkdir -p "$stage/docs"
           cp docs/regression-validation.md "$stage/docs/"
+          cp docs/observation.md docs/verification.md "$stage/docs/"
           tar czf "$stage.tar.gz" -C "$stage" .
 
       - name: Upload package artifact

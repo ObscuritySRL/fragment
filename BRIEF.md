@@ -1,5 +1,11 @@
 # Fragment — Multi-Backend Interception Brief
 
+> Historical roadmap, not a compatibility guarantee. Current Windows code adds
+> separate Schannel/exported-OpenSSL observation and Winsock activity/raw-byte
+> capture; it does not synthesize HTTP requests from arbitrary TLS streams.
+> See [implemented observation coverage](docs/observation.md). Static TLS, QUIC,
+> child processes and kernel/extension socket paths remain separate gaps.
+
 **Goal.** Today Fragment captures one HTTP stack (libcurl). This brief generalizes
 it so that *every* common request stack a target uses is routed to the **same**
 local proxy, preserving Fragment's existing invariant:

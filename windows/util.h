@@ -15,7 +15,7 @@ BOOL CreateAndEnableHook(const char* name, LPVOID pTarget, LPVOID pDetour, LPVOI
 
 inline BOOL MaskCompare(PVOID pBuffer, LPCSTR lpPattern, LPCSTR lpMask) {
     for (PBYTE value = pBuffer; *lpMask; ++lpPattern, ++lpMask, ++value) {
-        if (*lpMask == 'x' && *((LPCBYTE) lpPattern)!= *value)
+        if (*lpMask == 'x' && *((const BYTE*) lpPattern)!= *value)
             return FALSE;
     }
 

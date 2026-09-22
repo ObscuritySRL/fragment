@@ -4,5 +4,5 @@
 // -DFRAGMENT_VERSION="x.y.z" -- the release workflow injects the git tag --
 // and defaults to the in-development version otherwise.
 #ifndef FRAGMENT_VERSION
-#define FRAGMENT_VERSION "1.2.1"
+#define FRAGMENT_VERSION "1.3.0"
 #endif

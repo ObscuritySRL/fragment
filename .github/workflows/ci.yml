@@ -67,7 +67,6 @@ jobs:
           windows\build\host_mock.exe windows\build\Release\Fragment.dll windows\build\mockcurl.dll || exit /b 1
 
       - uses: oven-sh/setup-bun@v2
-        if: matrix.arch == 'x64'
 
       - name: Launcher argument regression
         if: matrix.arch == 'x64'
@@ -86,6 +85,14 @@ jobs:
         run: |
           cl /nologo /O2 /MD /W3 windows\test\host_winhttp.c /Fe:windows\build\Release\host_winhttp.exe /Fo:windows\build\host_winhttp.obj || exit /b 1
           bun windows/test/run_winhttp.ts --no-build || exit /b 1
+
+      - name: TLS and socket observation (native state, mock exports, loopback traffic)
+        shell: cmd
+        env:
+          FRAGMENT_TEST_BUILD: ${{ github.workspace }}/windows/build/Release
+        run: |
+          call windows\test\build_observe.bat windows\build\Release || exit /b 1
+          bun run test:observe || exit /b 1
 
       - name: Upload DLL artifact
         uses: actions/upload-artifact@v4
@@ -174,6 +181,16 @@ jobs:
           cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /LD windows\test\mockcurl.c /Fe:windows\build\mockcurl.dll /Fo:windows\build\mockcurl.obj || exit /b 1
           cl /nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS windows\test\host_mock.c    /Fe:windows\build\host_mock.exe /Fo:windows\build\host_mock.obj || exit /b 1
           windows\build\host_mock.exe windows\build\Release\Fragment.dll windows\build\mockcurl.dll || exit /b 1
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: TLS and socket observation (ARM64)
+        shell: cmd
+        env:
+          FRAGMENT_TEST_BUILD: ${{ github.workspace }}/windows/build/Release
+        run: |
+          call windows\test\build_observe.bat windows\build\Release || exit /b 1
+          bun run test:observe || exit /b 1
 
       - name: Upload DLL artifact
         uses: actions/upload-artifact@v4

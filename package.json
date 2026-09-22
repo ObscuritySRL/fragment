@@ -6,6 +6,7 @@
     "test": "bun test ./test",
     "test:windows": "bun windows/test/run.ts",
     "test:winhttp": "bun windows/test/run_winhttp.ts",
+    "test:observe": "bun windows/test/run_capture.ts && bun windows/test/run_schannel.ts --no-build && bun windows/test/run_network.ts --no-build && bun windows/test/run_openssl.ts --no-build",
     "test:linux": "bun linux/test/run.ts",
     "typecheck": "tsc --noEmit"
   },
